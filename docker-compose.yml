@@ -1,0 +1,28 @@
+version: '3.8'
+services:
+  control_api:
+    build: ./crates/control_api
+    ports:
+      - "8080:8080"
+    environment:
+      RUST_LOG: info
+      DATABASE_URL: postgres://postgres:password@db:5432/hickory
+      JWT_SECRET: replace_with_a_strong_secret
+    depends_on:
+      - db
+  ui:
+    build: ./web/ui
+    ports:
+      - "3000:80"
+    depends_on:
+      - control_api
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: hickory
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+volumes:
+  db_data:

@@ -1,0 +1,13 @@
+[package]
+name = "geodns"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+maxminddb = "0.23"
+serde = { version = "1.0", features = ["derive"] }
+geoip2 = "0.6"
+
+[lib]
+name = "geodns"
+path = "src/lib.rs"
