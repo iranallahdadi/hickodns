@@ -1,13 +1,17 @@
 version: '3.8'
 services:
   control_api:
-    build: ./crates/control_api
+    build:
+      context: .
+      dockerfile: crates/control_api/Dockerfile
     ports:
       - "8080:8080"
     environment:
       RUST_LOG: info
       DATABASE_URL: postgres://postgres:password@db:5432/hickory
       JWT_SECRET: replace_with_a_strong_secret
+      ADMIN_USERNAME: admin
+      ADMIN_PASSWORD: admin123
     depends_on:
       - db
     restart: unless-stopped

@@ -1,4 +1,5 @@
 use actix_web::{web, App, HttpResponse, HttpServer, Responder, HttpRequest, http::header};
+use actix_cors::Cors;
 use serde::{Deserialize, Serialize};
 use log::{info, warn};
 use tokio_postgres::{NoTls, Client as PgClient};
@@ -113,8 +114,9 @@ async fn create_user(req: web::Json<LoginRequest>, data: web::Data<AppState>) ->
     let password_hash = argon2.hash_password(req.password.as_bytes(), &salt).unwrap().to_string();
     let id = Uuid::new_v4();
     let role = "user";
+    // pass a UUID directly to avoid parameter serialization errors
     let id_str = id.to_string();
-    let res = (&*data.db).execute("INSERT INTO users (id, username, password_hash, role) VALUES ($1::uuid, $2, $3, $4)", &[&id_str, &req.username, &password_hash, &role]).await;
+    let res = (&*data.db).execute("INSERT INTO users (id, username, password_hash, role) VALUES ($1, $2, $3, $4)", &[&id_str, &req.username, &password_hash, &role]).await;
     match res {
         Ok(_) => HttpResponse::Created().json(serde_json::json!({"id": id.to_string()})),
         Err(e) => {
@@ -164,7 +166,7 @@ async fn create_server(body: web::Json<CreateServerReq>, data: web::Data<AppStat
     }
     let id = Uuid::new_v4();
     let id_str = id.to_string();
-    let res = (&*data.db).execute("INSERT INTO servers (id, name, address, region) VALUES ($1::uuid, $2, $3, $4)", &[&id_str, &body.name, &body.address, &body.region]).await;
+    let res = (&*data.db).execute("INSERT INTO servers (id, name, address, region) VALUES ($1, $2, $3, $4)", &[&id_str, &body.name, &body.address, &body.region]).await;
     match res {
         Ok(_) => HttpResponse::Created().json(serde_json::json!({"id": id.to_string()})),
         Err(e) => {
@@ -197,7 +199,7 @@ async fn agent_register(body: web::Json<AgentRegistration>, data: web::Data<AppS
     let token_hash = argon2.hash_password(token_plain.as_bytes(), &salt).unwrap().to_string();
 
     let res = (&*data.db).execute(
-        "INSERT INTO agents (id, name, addr, token_hash) VALUES ($1::uuid, $2, $3, $4)",
+        "INSERT INTO agents (id, name, addr, token_hash) VALUES ($1, $2, $3, $4)",
         &[&id_str, &body.name, &body.addr, &token_hash]
     ).await;
     match res {
@@ -419,7 +421,7 @@ async fn create_georule(body: web::Json<CreateGeoRuleReq>, data: web::Data<FullS
     };
     let id_str = id.to_string();
     let zone_str = zone_uuid.to_string();
-    let res = (&*data.inner.db).execute("INSERT INTO georules (id, zone_id, match_type, match_value, target) VALUES ($1::uuid, $2::uuid, $3, $4, $5)", &[&id_str, &zone_str, &body.match_type, &body.match_value, &body.target]).await;
+    let res = (&*data.inner.db).execute("INSERT INTO georules (id, zone_id, match_type, match_value, target) VALUES ($1, $2, $3, $4, $5)", &[&id_str, &zone_str, &body.match_type, &body.match_value, &body.target]).await;
     match res {
         Ok(_) => HttpResponse::Created().json(serde_json::json!({"id": id.to_string()})),
         Err(e) => { warn!("create_georule error: {}", e); HttpResponse::InternalServerError().finish() }
@@ -468,7 +470,11 @@ async fn create_zone(body: web::Json<CreateZoneReq>, data: web::Data<AppState>, 
     let owner = tok.claims.sub.clone();
     let id = Uuid::new_v4();
     let id_str = id.to_string();
-    let res = (&*data.db).execute("INSERT INTO zones (id, domain, owner) VALUES ($1::uuid, $2, $3::uuid)", &[&id_str, &body.domain, &owner]).await;
+    let safe_domain = body.domain.replace("'", "''");
+    let safe_owner = owner.replace("'", "''");
+    let insert_sql = format!("INSERT INTO zones (id, domain, owner) VALUES ('{}', '{}', '{}')", id_str, safe_domain, safe_owner);
+    info!("create_zone (formatted SQL): {}", insert_sql);
+    let res = (&*data.db).execute(insert_sql.as_str(), &[]).await;
     match res {
         Ok(_) => HttpResponse::Created().json(serde_json::json!({"id": id.to_string()})),
         Err(e) => {
@@ -629,10 +635,11 @@ async fn push_config_to_agents(
         let id_str = id.to_string();
         let zone_id_str = zone_id.into_inner();
     
-        let res = (&*data.db).execute(
-            "INSERT INTO records (id, zone_id, name, type, value, ttl) VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6)",
-            &[&id_str, &zone_id_str, &body.name, &body.record_type, &body.value, &body.ttl.to_string()]
-        ).await;
+        let safe_name = body.name.replace("'", "''");
+        let safe_value = body.value.replace("'", "''");
+        let insert_sql = format!("INSERT INTO records (id, zone_id, name, type, value, ttl) VALUES ('{}', '{}', '{}', '{}', '{}', {})", id_str, zone_id_str, safe_name, body.record_type, safe_value, body.ttl);
+        info!("create_record (formatted SQL): {}", insert_sql);
+        let res = (&*data.db).execute(insert_sql.as_str(), &[]).await;
     
         match res {
             Ok(_) => HttpResponse::Created().json(serde_json::json!({"id": id.to_string()})),
@@ -726,7 +733,7 @@ async fn push_config_to_agents(
         }
     
         let query = format!(
-            "UPDATE records SET {} WHERE id::text = ${}::uuid AND zone_id::text = ${}::uuid",
+            "UPDATE records SET {} WHERE id::text = ${} AND zone_id::text = ${}",
             updates.join(", "), param_idx, param_idx + 1
         );
     
@@ -796,6 +803,45 @@ async fn main() -> std::io::Result<()> {
         }
     });
     migrate_db(&client).await.expect("db migrate failed");
+
+    // Bootstrap admin user if environment variables are set
+    if let (Ok(admin_user), Ok(admin_password)) = (std::env::var("ADMIN_USERNAME"), std::env::var("ADMIN_PASSWORD")) {
+        // check if a user exists with that username
+        if let Ok(rows) = (&client).query("SELECT id::text, password_hash FROM users WHERE username = $1 LIMIT 1", &[&admin_user]).await {
+            if rows.is_empty() {
+                // create new admin
+                let mut rng = OsRng;
+                let salt = SaltString::generate(&mut rng);
+                let argon2 = Argon2::default();
+                let password_hash = argon2.hash_password(admin_password.as_bytes(), &salt).unwrap().to_string();
+                let id = Uuid::new_v4();
+                let id_str = id.to_string();
+                let role = "admin";
+                match (&client).execute("INSERT INTO users (id, username, password_hash, role) VALUES ($1, $2, $3, $4)", &[&id_str, &admin_user, &password_hash, &role]).await {
+                    Ok(_) => info!("Bootstrapped admin user '{}'", admin_user),
+                    Err(e) => warn!("Failed to create admin user '{}': {}", admin_user, e),
+                }
+            } else {
+                // user exists, ensure password_hash looks valid (contains $argon2)
+                let existing_hash: String = rows[0].get(1);
+                if !existing_hash.starts_with("$argon2") {
+                    let mut rng = OsRng;
+                    let salt = SaltString::generate(&mut rng);
+                    let argon2 = Argon2::default();
+                    let password_hash = argon2.hash_password(admin_password.as_bytes(), &salt).unwrap().to_string();
+                    match (&client).execute("UPDATE users SET password_hash = $1 WHERE username = $2", &[&password_hash, &admin_user]).await {
+                        Ok(_) => info!("Updated admin user '{}' password hash", admin_user),
+                        Err(e) => warn!("Failed to update admin user '{}': {}", admin_user, e),
+                    }
+                } else {
+                    info!("Admin user already exists, skipping bootstrap");
+                }
+            }
+        } else {
+            warn!("Failed to query for admin user during bootstrap");
+        }
+    }
+
     let app_state = AppState { db: std::sync::Arc::new(client), jwt_secret: jwt_secret.clone() };
 
     // Load GeoIP DB if provided
@@ -813,6 +859,7 @@ async fn main() -> std::io::Result<()> {
 
         HttpServer::new(move || {
             App::new()
+                .wrap(Cors::default().allow_any_origin().allow_any_method().allow_any_header())
                 .wrap(prometheus.clone())
                 .app_data(app_data.clone())
                 .app_data(full_data.clone())
