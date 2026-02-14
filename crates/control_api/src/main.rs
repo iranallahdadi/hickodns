@@ -1,4 +1,21 @@
 use actix_web::{web, App, HttpResponse, HttpServer, Responder, HttpRequest, http::header};
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+use log::{info, warn};
+use std::sync::Arc;
+use std::collections::HashMap;
+use std::process::Command;
+use tokio_postgres::NoTls;
+use argon2::{Argon2, PasswordHash, PasswordVerifier, PasswordHasher};
+use argon2::password_hash::SaltString;
+use rand_core::OsRng;
+use jsonwebtoken::{encode, decode, Header, EncodingKey, DecodingKey, Validation, TokenData};
+use uuid::Uuid;
+use actix_cors::Cors;
+use actix_web_prom::PrometheusMetricsBuilder;
+use prometheus::{TextEncoder, Encoder};
+use prometheus::gather;
+use chrono::TimeZone;
 
 // ============================================================================
 // OpenAPI / Swagger Types
@@ -63,7 +80,7 @@ struct ZoneWithOwner {
 
 #[derive(Clone)]
 struct AppState {
-    db: Arc<PgClient>,
+    db: Arc<tokio_postgres::Client>,
     jwt_secret: String,
 }
 
@@ -114,7 +131,7 @@ fn validate_record_type(record_type: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn migrate_db(client: &PgClient) -> Result<(), tokio_postgres::Error> {
+async fn migrate_db(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
     client.batch_execute(
         "CREATE TABLE IF NOT EXISTS users (
             id UUID PRIMARY KEY,
@@ -268,6 +285,17 @@ async fn login(body: web::Json<LoginRequest>, data: web::Data<AppState>) -> impl
     HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid credentials"}))
 }
 
+async fn logout(req: HttpRequest) -> impl Responder {
+    if let Some(auth) = req.headers().get("authorization") {
+        if let Ok(token) = auth.to_str() {
+            if token.starts_with("Bearer ") {
+                return HttpResponse::Ok().json(serde_json::json!({"message": "logged out successfully"}));
+            }
+        }
+    }
+    HttpResponse::Ok().json(serde_json::json!({"message": "no active session"}))
+}
+
 async fn create_user(req: web::Json<LoginRequest>, data: web::Data<AppState>) -> impl Responder {
     let username = req.username.trim();
     if username.is_empty() || username.len() < 3 {
@@ -308,6 +336,125 @@ async fn create_user(req: web::Json<LoginRequest>, data: web::Data<AppState>) ->
                 HttpResponse::InternalServerError().json(serde_json::json!({"error": "failed to create user"}))
             }
         }
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdateUserReq {
+    username: Option<String>,
+    role: Option<String>,
+}
+
+async fn get_user(path: web::Path<String>, data: web::Data<AppState>, req: HttpRequest) -> impl Responder {
+    let user_id = path.into_inner();
+    if auth_from_header(&req, &data.jwt_secret).is_none() {
+        return HttpResponse::Unauthorized().json(serde_json::json!({"error": "unauthorized"}));
+    }
+    
+    match (&*data.db).query(
+        "SELECT id, username, role, created_at FROM users WHERE id = $1",
+        &[&user_id]
+    ).await {
+        Ok(rows) => {
+            if rows.is_empty() {
+                return HttpResponse::NotFound().json(serde_json::json!({"error": "user not found"}));
+            }
+            let row = &rows[0];
+            let id: String = row.get(0);
+            let username: String = row.get(1);
+            let role: String = row.get(2);
+            let created_at: String = row.get(3);
+            HttpResponse::Ok().json(serde_json::json!({
+                "id": id,
+                "username": username,
+                "role": role,
+                "createdAt": created_at
+            }))
+        }
+        Err(e) => {
+            warn!("get_user error: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({"error": "database error"}))
+        }
+    }
+}
+
+async fn update_user(path: web::Path<String>, body: web::Json<UpdateUserReq>, data: web::Data<AppState>, req: HttpRequest) -> impl Responder {
+    let user_id = path.into_inner();
+    let tok = match auth_from_header(&req, &data.jwt_secret) {
+        Some(t) => t,
+        None => return HttpResponse::Unauthorized().json(serde_json::json!({"error": "unauthorized"})),
+    };
+    
+    if tok.claims.role != "admin" {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "admin role required"}));
+    }
+    
+    if let Some(username) = &body.username {
+        if username.len() < 3 {
+            return HttpResponse::BadRequest().json(serde_json::json!({"error": "username must be at least 3 characters"}));
+        }
+        match (&*data.db).execute(
+            "UPDATE users SET username = $1, updated_at = now() WHERE id::text = $2",
+            &[username, &user_id]
+        ).await {
+            Ok(result) => {
+                if result > 0 {
+                    HttpResponse::Ok().json(serde_json::json!({"message": "user updated"}))
+                } else {
+                    HttpResponse::NotFound().json(serde_json::json!({"error": "user not found"}))
+                }
+            }
+            Err(e) => {
+                if e.to_string().contains("unique") || e.to_string().contains("duplicate") {
+                    HttpResponse::Conflict().json(serde_json::json!({"error": "username already exists"}))
+                } else {
+                    HttpResponse::InternalServerError().json(serde_json::json!({"error": "failed to update user"}))
+                }
+            }
+        }
+    } else if let Some(role) = &body.role {
+        match (&*data.db).execute(
+            "UPDATE users SET role = $1, updated_at = now() WHERE id::text = $2",
+            &[role, &user_id]
+        ).await {
+            Ok(result) => {
+                if result > 0 {
+                    HttpResponse::Ok().json(serde_json::json!({"message": "user updated"}))
+                } else {
+                    HttpResponse::NotFound().json(serde_json::json!({"error": "user not found"}))
+                }
+            }
+            Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("failed to update user: {}", e)}))
+        }
+    } else {
+        HttpResponse::BadRequest().json(serde_json::json!({"error": "no fields to update"}))
+    }
+}
+
+async fn delete_user(path: web::Path<String>, data: web::Data<AppState>, req: HttpRequest) -> impl Responder {
+    let user_id = path.into_inner();
+    let tok = match auth_from_header(&req, &data.jwt_secret) {
+        Some(t) => t,
+        None => return HttpResponse::Unauthorized().json(serde_json::json!({"error": "unauthorized"})),
+    };
+    
+    if tok.claims.role != "admin" {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "admin role required"}));
+    }
+    
+    if user_id == tok.claims.sub {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "cannot delete yourself"}));
+    }
+    
+    match (&*data.db).execute("DELETE FROM users WHERE id::text = $1", &[&user_id]).await {
+        Ok(result) => {
+            if result > 0 {
+                HttpResponse::Ok().json(serde_json::json!({"message": "user deleted"}))
+            } else {
+                HttpResponse::NotFound().json(serde_json::json!({"error": "user not found"}))
+            }
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("failed to delete user: {}", e)}))
     }
 }
 
@@ -513,19 +660,28 @@ async fn start_dns_server(body: web::Json<StartDnsReq>, data: web::Data<FullStat
     }
 
     let server_id = body.id.clone();
-    // create temp zone dir
-    let zonedir = format!("/tmp/hickory_control/{}", server_id);
-    if let Err(e) = std::fs::create_dir_all(&zonedir) {
-        warn!("failed create zonedir {}: {}", zonedir, e);
-        return HttpResponse::InternalServerError().body("failed to create zonedir");
+    let bind_addr = if body.bind.is_empty() { "0.0.0.0".to_string() } else {
+        body.bind.split(':').next().unwrap_or("0.0.0.0").to_string()
+    };
+    let port: u16 = if body.bind.is_empty() { 53 } else {
+        body.bind.split(':').last().unwrap_or("53").parse().unwrap_or(53)
+    };
+
+    // create temp config dir
+    let config_dir = format!("/tmp/hickory_control/{}", server_id);
+    if let Err(e) = std::fs::create_dir_all(&config_dir) {
+        warn!("failed create config dir {}: {}", config_dir, e);
+        return HttpResponse::InternalServerError().body("failed to create config dir");
     }
 
     // write zone files from DB
     let zones = (&*data.inner.db).query("SELECT id::text, domain FROM zones", &[]).await.unwrap_or_default();
+    let mut zone_configs = String::new();
+    
     for z in zones.into_iter() {
         let zid: String = z.get(0);
         let domain: String = z.get(1);
-        let fname = format!("{}/{}.zone", zonedir, domain.replace('.', "_"));
+        let fname = format!("{}/{}.zone", config_dir, domain.replace('.', "_").replace("-", "_"));
         if let Ok(mut f) = std::fs::File::create(&fname) {
             use std::io::Write;
             let soa = format!("@ 3600 IN SOA ns.{} hostmaster.{} 1 3600 3600 604800 3600\n", domain, domain);
@@ -536,22 +692,71 @@ async fn start_dns_server(body: web::Json<StartDnsReq>, data: web::Data<FullStat
                 let typ: String = r.get(1);
                 let value: String = r.get(2);
                 let ttl: i32 = r.get(3);
-                let rr = format!("{} {} IN {} {}\n", if name.is_empty() { "@" } else { &name }, ttl, typ, value);
+                let rr = format!("{} {} IN {} {}\n", if name.is_empty() || name == "@" { "@" } else { &name }, ttl, typ, value);
                 let _ = f.write_all(rr.as_bytes());
             }
+        }
+        zone_configs.push_str(&format!(
+            r#"[[zones]]
+zone = "{}"
+zone_type = "Primary"
+file = "{}.zone"
+
+"#,
+            domain.trim_end_matches('.'),
+            domain.replace('.', "_").replace("-", "_")
+        ));
+    }
+
+    // Generate TOML config
+    let config_content = format!(
+        r#"# Auto-generated config for Hickory DNS
+listen_addrs_ipv4 = ["{}"]
+listen_port = {}
+
+{}
+
+[[zones]]
+zone = "localhost"
+zone_type = "Primary"
+file = "default/localhost.zone"
+
+[[zones]]
+zone = "0.0.127.in-addr.arpa"
+zone_type = "Primary"
+file = "default/127.0.0.1.zone"
+"#,
+        bind_addr,
+        port,
+        zone_configs
+    );
+
+    let config_path = format!("{}/named.toml", config_dir);
+    if let Err(e) = std::fs::write(&config_path, config_content) {
+        warn!("failed write config {}: {}", config_path, e);
+        return HttpResponse::InternalServerError().body("failed to write config");
+    }
+
+    // Copy default zone files if they exist
+    let default_zones = ["localhost.zone", "127.0.0.1.zone"];
+    for dz in default_zones.iter() {
+        let src = format!("/home/outis/work-github/OutisCloud-hickory-dns/tests/test-data/test_configs/default/{}", dz);
+        let dst = format!("{}/default/{}", config_dir, dz);
+        if std::path::Path::new(&src).exists() {
+            let _ = std::fs::create_dir_all(format!("{}/default", config_dir));
+            let _ = std::fs::copy(&src, &dst);
         }
     }
 
     let bin = std::env::var("HICKORY_DNS_BIN").unwrap_or_else(|_| "./target/debug/hickory-dns".to_string());
-    let port_arg = if body.bind.is_empty() { "0".to_string() } else { body.bind.clone() };
     let mut cmd = Command::new(bin);
-    cmd.arg("-d").arg(format!("--zonedir={}", zonedir)).arg(format!("--port={}", port_arg));
+    cmd.arg("-d").arg(format!("-c={}", config_path));
 
     match cmd.spawn() {
         Ok(child) => {
             let mut procs = data.processes.lock().await;
             procs.insert(server_id.clone(), child);
-            HttpResponse::Ok().json(serde_json::json!({"status":"started","server_id": server_id}))
+            HttpResponse::Ok().json(serde_json::json!({"status":"started","server_id": server_id, "bind": format!("{}:{}", bind_addr, port)}))
         }
         Err(e) => {
             warn!("failed spawning dns process: {}", e);
@@ -587,6 +792,64 @@ async fn stop_dns_server(body: web::Json<StopDnsReq>, data: web::Data<FullState>
         }
     } else {
         HttpResponse::NotFound().body("server not found or not running")
+    }
+}
+
+async fn dns_status(data: web::Data<FullState>, req: HttpRequest) -> impl Responder {
+    if let Some(tok) = auth_from_header(&req, &data.inner.jwt_secret) {
+        if tok.claims.role != "admin" {
+            return HttpResponse::Forbidden().json(serde_json::json!({"error": "admin role required"}));
+        }
+    } else {
+        return HttpResponse::Unauthorized().json(serde_json::json!({"error": "unauthorized"}));
+    }
+
+    let procs = data.processes.lock().await;
+    let mut servers: Vec<serde_json::Value> = Vec::new();
+    
+    for (id, _) in procs.iter() {
+        servers.push(serde_json::json!({
+            "id": id,
+            "status": "running"
+        }));
+    }
+    
+    HttpResponse::Ok().json(serde_json::json!({
+        "servers": servers,
+        "total": servers.len()
+    }))
+}
+
+#[derive(Deserialize)]
+struct ReloadDnsReq {
+    id: String,
+}
+
+async fn dns_reload(body: web::Json<ReloadDnsReq>, data: web::Data<FullState>, req: HttpRequest) -> impl Responder {
+    if let Some(tok) = auth_from_header(&req, &data.inner.jwt_secret) {
+        if tok.claims.role != "admin" {
+            return HttpResponse::Forbidden().json(serde_json::json!({"error": "admin role required"}));
+        }
+    } else {
+        return HttpResponse::Unauthorized().json(serde_json::json!({"error": "unauthorized"}));
+    }
+
+    let server_id = body.id.clone();
+    let mut procs = data.processes.lock().await;
+    
+    if let Some(mut child) = procs.get_mut(&server_id) {
+        match child.kill() {
+            Ok(_) => {
+                drop(procs);
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                let mut new_procs = data.processes.lock().await;
+                new_procs.remove(&server_id);
+                HttpResponse::Ok().json(serde_json::json!({"status": "reloaded", "server_id": server_id}))
+            }
+            Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("failed to reload: {}", e)}))
+        }
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "server not found"}))
     }
 }
 
@@ -654,7 +917,7 @@ async fn list_zones(data: web::Data<AppState>, req: HttpRequest) -> impl Respond
         created_at: r.get(4),
     }).collect();
     
-    HttpResponse::Ok().json(APIResponse { success: true, data: Some(zones), error: None })
+    HttpResponse::Ok().json(ApiResponse { success: true, data: Some(zones), error: None })
 }
 
 async fn create_zone(body: web::Json<CreateZoneReq>, data: web::Data<AppState>, req: HttpRequest) -> impl Responder {
@@ -673,17 +936,19 @@ async fn create_zone(body: web::Json<CreateZoneReq>, data: web::Data<AppState>, 
     let id = Uuid::new_v4();
     let id_str = id.to_string();
     let owner_str = owner.clone();
+    let domain = body.domain.clone();
     
     match (&*data.db).execute(
         "INSERT INTO zones (id, domain, owner) VALUES ($1, $2, $3)",
-        &[&id_str, &body.domain, &owner_str]
+        &[&id_str, &domain, &owner_str]
     ).await {
         Ok(_) => {
             info!("Created zone: {} for owner: {}", body.domain, owner);
             // Log to audit
+            let details = serde_json::json!({"domain": &body.domain}).to_string();
             let _ = (&*data.db).execute(
                 "INSERT INTO audit_logs (id, user_id, action, resource_type, resource_id, details) VALUES ($1, $2, $3, $4, $5, $6)",
-                &[&Uuid::new_v4().to_string(), &owner, &"create", &"zone", &id_str, &serde_json::json!({"domain": &body.domain})]
+                &[&Uuid::new_v4().to_string(), &owner, &"create", &"zone", &id.to_string(), &details]
             ).await;
             HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "domain": &body.domain}))
         }
@@ -693,7 +958,7 @@ async fn create_zone(body: web::Json<CreateZoneReq>, data: web::Data<AppState>, 
                 HttpResponse::Conflict().json(serde_json::json!({"error": "domain already exists"}))
             } else {
                 warn!("create_zone error: {}", e);
-                HttpResponse::InternalServerError().json(serde_json::json!({"error": "failed to create zone"}))
+                HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("failed to create zone: {}", e)}))
             }
         }
     }
@@ -913,7 +1178,6 @@ async fn push_config_to_agents(
             .await
             .unwrap_or_default();
     
-        let ttl_val: i32 = row.get(5);
         let records: Vec<RecordResponse> = rows.into_iter().map(|r| RecordResponse {
             id: r.get(0),
             zone_id: r.get(1),
@@ -1040,7 +1304,7 @@ async fn push_config_to_agents(
                     HttpResponse::NotFound().json(ErrorResponse { error: "record not found".to_string(), details: None })
                 } else {
                     info!("Deleted record: {} from zone: {}", record_id, zone_id);
-                    HttpResponse::Ok().json(APIResponse { success: true, data: Some(()), error: None })
+                    HttpResponse::Ok().json(ApiResponse { success: true, data: Some(()), error: None })
                 }
             }
             Err(e) => {
@@ -1102,7 +1366,7 @@ async fn push_config_to_agents(
             created_at: r.get(7),
         }).collect();
         
-        HttpResponse::Ok().json(APIResponse { success: true, data: Some(logs), error: None })
+        HttpResponse::Ok().json(ApiResponse { success: true, data: Some(logs), error: None })
     }
 
     // Get zone by ID
@@ -1130,10 +1394,99 @@ async fn push_config_to_agents(
                     zone_type: row.get(3),
                     created_at: row.get(4),
                 };
-                HttpResponse::Ok().json(APIResponse { success: true, data: Some(zone), error: None })
+                HttpResponse::Ok().json(ApiResponse { success: true, data: Some(zone), error: None })
             }
             Err(_) => HttpResponse::NotFound().json(ErrorResponse { error: "zone not found".to_string(), details: None })
         }
+    }
+
+    // Export zone
+    async fn export_zone(
+        path: web::Path<String>,
+        data: web::Data<AppState>,
+        req: HttpRequest,
+    ) -> impl Responder {
+        let auth = auth_from_header(&req, &data.jwt_secret);
+        if auth.is_none() {
+            return HttpResponse::Unauthorized().json(ErrorResponse { error: "unauthorized".to_string(), details: None });
+        }
+        
+        let zone_id = path.into_inner();
+        
+        let zone_row = match (&*data.db).query_opt(
+            "SELECT domain FROM zones WHERE id::text = $1",
+            &[&zone_id]
+        ).await {
+            Ok(Some(row)) => row,
+            _ => return HttpResponse::NotFound().json(ErrorResponse { error: "zone not found".to_string(), details: None })
+        };
+        
+        let domain: String = zone_row.get(0);
+        
+        let records = (&*data.db).query(
+            "SELECT name, type, value, ttl FROM records WHERE zone_id::text = $1",
+            &[&zone_id]
+        ).await.unwrap_or_default();
+        
+        let mut zone_content = format!("$ORIGIN {}\n$TTL 3600\n\n", domain);
+        zone_content.push_str(&format!("@ 3600 IN SOA ns.{} hostmaster.{} 1 3600 3600 604800 3600\n\n", domain, domain));
+        
+        for r in records {
+            let name: String = r.get(0);
+            let typ: String = r.get(1);
+            let value: String = r.get(2);
+            let ttl: i32 = r.get(3);
+            zone_content.push_str(&format!("{} {} IN {} {}\n", if name.is_empty() || name == "@" { "@" } else { &name }, ttl, typ, value));
+        }
+        
+        HttpResponse::Ok()
+            .content_type("text/plain")
+            .body(zone_content)
+    }
+
+    #[derive(Deserialize)]
+    struct ImportZoneReq {
+        records: Vec<ImportRecordReq>,
+    }
+
+    #[derive(Deserialize)]
+    struct ImportRecordReq {
+        name: String,
+        record_type: String,
+        value: String,
+        ttl: Option<u32>,
+    }
+
+    // Import zone
+    async fn import_zone(
+        path: web::Path<String>,
+        body: web::Json<ImportZoneReq>,
+        data: web::Data<AppState>,
+        req: HttpRequest,
+    ) -> impl Responder {
+        let auth = auth_from_header(&req, &data.jwt_secret);
+        if auth.is_none() {
+            return HttpResponse::Unauthorized().json(ErrorResponse { error: "unauthorized".to_string(), details: None });
+        }
+        
+        let zone_id = path.into_inner();
+        
+        let mut imported = 0;
+        for record in body.records.iter() {
+            let ttl = record.ttl.unwrap_or(3600) as i32;
+            match (&*data.db).execute(
+                "INSERT INTO records (id, zone_id, name, type, value, ttl) VALUES ($1, $2, $3, $4, $5, $6)",
+                &[&Uuid::new_v4().to_string(), &zone_id, &record.name, &record.record_type, &record.value, &ttl]
+            ).await {
+                Ok(_) => imported += 1,
+                Err(e) => warn!("failed to import record: {}", e)
+            }
+        }
+        
+        HttpResponse::Ok().json(serde_json::json!({
+            "imported": imported,
+            "zone_id": zone_id
+        }))
     }
 
     // Delete zone
@@ -1171,7 +1524,7 @@ async fn push_config_to_agents(
                     HttpResponse::NotFound().json(ErrorResponse { error: "zone not found".to_string(), details: None })
                 } else {
                     info!("Deleted zone: {}", zone_id);
-                    HttpResponse::Ok().json(APIResponse { success: true, data: Some(()), error: None })
+                    HttpResponse::Ok().json(ApiResponse { success: true, data: Some(()), error: None })
                 }
             }
             Err(e) => {
@@ -1267,8 +1620,12 @@ async fn main() -> std::io::Result<()> {
             .route("/ready", web::get().to(ready))
             // Auth
             .route("/api/v1/auth/login", web::post().to(login))
+            .route("/api/v1/auth/logout", web::post().to(logout))
             // Users
             .route("/api/v1/users", web::post().to(create_user))
+            .route("/api/v1/users/{id}", web::get().to(get_user))
+            .route("/api/v1/users/{id}", web::put().to(update_user))
+            .route("/api/v1/users/{id}", web::delete().to(delete_user))
             // Servers
             .route("/api/v1/servers", web::get().to(list_servers))
             .route("/api/v1/servers", web::post().to(create_server))
@@ -1277,6 +1634,8 @@ async fn main() -> std::io::Result<()> {
             .route("/api/v1/zones", web::post().to(create_zone))
             .route("/api/v1/zones/{id}", web::get().to(get_zone))
             .route("/api/v1/zones/{id}", web::delete().to(delete_zone))
+            .route("/api/v1/zones/{id}/export", web::get().to(export_zone))
+            .route("/api/v1/zones/{id}/import", web::post().to(import_zone))
             // Records
             .route("/api/v1/zones/{id}/records", web::post().to(create_record))
             .route("/api/v1/zones/{id}/records", web::get().to(list_records))
@@ -1291,6 +1650,8 @@ async fn main() -> std::io::Result<()> {
             // DNS Control
             .route("/api/v1/dns/start", web::post().to(start_dns_server))
             .route("/api/v1/dns/stop", web::post().to(stop_dns_server))
+            .route("/api/v1/dns/status", web::get().to(dns_status))
+            .route("/api/v1/dns/reload", web::post().to(dns_reload))
             // GeoRules
             .route("/api/v1/georules", web::post().to(create_georule))
             .route("/api/v1/georules", web::get().to(list_georules))
