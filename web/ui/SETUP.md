@@ -214,6 +214,9 @@ docker run -p 3000:3000 hickory-ui:latest
 
 **UI won't connect to API?**
 - Check `api.js` — `baseURL` must match running API
+- By default the API allows three origins: `localhost:3000`, `localhost:5173` and
+  `localhost:8081`.  If you change the port you must update `env/api.env` or set
+  `ALLOWED_ORIGINS` accordingly.
 - Check browser console for CORS errors
 - Ensure API is running and accessible
 

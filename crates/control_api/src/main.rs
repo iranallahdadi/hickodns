@@ -17,6 +17,50 @@ use prometheus::{TextEncoder, Encoder};
 use prometheus::gather;
 use chrono::TimeZone;
 
+/// Build a CORS middleware instance based on the `ALLOWED_ORIGINS`
+/// environment variable.  The value may be a comma-separated list of
+/// origins or a single asterisk (`*`) to allow any origin.  When the
+/// variable is missing we fall back to a small set of development
+/// defaults (including the UI port on `localhost:8081`).
+///
+/// The resulting middleware is applied to every `App` instance and
+/// automatically handles preflight requests (OPTIONS) and populates
+/// the `Access-Control-Allow-Origin` header for permitted origins.
+fn cors_middleware() -> Cors {
+    // gather configuration from environment
+    let maybe_env = std::env::var("ALLOWED_ORIGINS");
+    let cors_origins = maybe_env.clone().unwrap_or_else(|_| {
+        "http://localhost:3000,http://localhost:5173,http://localhost:8081".to_string()
+    });
+
+    // if user explicitly provided a list but forgot the common
+    // development UI port, emit a warning so they don't waste time
+    if maybe_env.is_ok()
+        && cors_origins.trim() != "*"
+        && !cors_origins.split(',').any(|o| o.trim() == "http://localhost:8081")
+    {
+        warn!("ALLOWED_ORIGINS does not include the default UI origin http://localhost:8081; login from the built-in docker UI may fail");
+    }
+
+    let mut cors = Cors::default()
+        .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+        .allowed_headers(vec![header::AUTHORIZATION, header::CONTENT_TYPE])
+        .max_age(3600);
+
+    if cors_origins.trim() == "*" {
+        cors = cors.allow_any_origin();
+    } else {
+        for origin in cors_origins.split(',') {
+            let o = origin.trim();
+            if !o.is_empty() {
+                cors = cors.allowed_origin(o);
+            }
+        }
+    }
+
+    cors
+}
+
 // ============================================================================
 // OpenAPI / Swagger Types
 // ============================================================================
@@ -1793,24 +1837,11 @@ async fn main() -> std::io::Result<()> {
     let app_data = web::Data::new(app_state.clone());
     let full_data = web::Data::new(full_state.clone());
     
-    // Build CORS with allowed origins from environment
-    let cors_origins = std::env::var("ALLOWED_ORIGINS")
-        .unwrap_or_else(|_| "http://localhost:3000,http://localhost:5173,http://localhost:8081".to_string());
-
+    // Build the HTTP server; CORS configuration is pulled in via helper below
     HttpServer::new(move || {
-        // Build CORS inside closure (can't be cloned)
-        let mut cors = Cors::default()
-            .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
-            .allowed_headers(vec!["Authorization", "Content-Type"])
-            .max_age(3600);
-        
-        for origin in cors_origins.split(',') {
-            let o = origin.trim();
-            if !o.is_empty() {
-                cors = cors.allowed_origin(o);
-            }
-        }
-        
+        // every worker will recreate the middleware from the current environment
+        let cors = cors_middleware();
+
         App::new()
                 .wrap(cors)
                 .wrap(prometheus.clone())
@@ -1876,4 +1907,134 @@ async fn main() -> std::io::Result<()> {
     .bind(("0.0.0.0", 8080))?
     .run()
     .await
+}
+
+// ------------------------------------------------------------
+// Tests
+// ------------------------------------------------------------
+
+#[cfg(test)]
+mod cors_tests {
+    use super::*;
+    use actix_web::{test, App, http, web, HttpResponse};
+
+    #[actix_web::test]
+    async fn allowed_origin_and_preflight() {
+        std::env::set_var("ALLOWED_ORIGINS", "http://foo.example");
+        let app = test::init_service(
+            App::new()
+                .wrap(cors_middleware())
+                .route(
+                    "/test",
+                    web::post().to(|| async { HttpResponse::Ok().finish() }),
+                ),
+        )
+        .await;
+
+        // preflight OPTIONS
+        let req = test::TestRequest::default()
+            .method(http::Method::OPTIONS)
+            .uri("/test")
+            .insert_header((http::header::ORIGIN, "http://foo.example"))
+            .insert_header((http::header::ACCESS_CONTROL_REQUEST_METHOD, "POST"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .map(|v| v.to_str().unwrap()),
+            Some("http://foo.example"),
+        );
+
+        // actual POST
+        let req = test::TestRequest::post()
+            .uri("/test")
+            .insert_header((http::header::ORIGIN, "http://foo.example"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .map(|v| v.to_str().unwrap()),
+            Some("http://foo.example"),
+        );
+    }
+
+    #[actix_web::test]
+    async fn disallowed_origin() {
+        std::env::set_var("ALLOWED_ORIGINS", "http://foo.example");
+        let app = test::init_service(
+            App::new()
+                .wrap(cors_middleware())
+                .route(
+                    "/test",
+                    web::get().to(|| async { HttpResponse::Ok().finish() }),
+                ),
+        )
+        .await;
+        let req = test::TestRequest::get()
+            .uri("/test")
+            .insert_header((http::header::ORIGIN, "http://bar.example"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert!(resp
+            .headers()
+            .get(http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none());
+    }
+
+    #[actix_web::test]
+    async fn wildcard_allows_any_origin() {
+        std::env::set_var("ALLOWED_ORIGINS", "*");
+        let app = test::init_service(
+            App::new()
+                .wrap(cors_middleware())
+                .route(
+                    "/test",
+                    web::post().to(|| async { HttpResponse::Ok().finish() }),
+                ),
+        )
+        .await;
+        let req = test::TestRequest::post()
+            .uri("/test")
+            .insert_header((http::header::ORIGIN, "http://anything"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        // actix-cors echoes the origin when allow_any_origin is enabled
+        assert_eq!(
+            resp.headers()
+                .get(http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .map(|v| v.to_str().unwrap()),
+            Some("http://anything")
+        );
+    }
+
+    #[actix_web::test]
+    async fn default_includes_8081() {
+        std::env::remove_var("ALLOWED_ORIGINS");
+        let app = test::init_service(
+            App::new()
+                .wrap(cors_middleware())
+                .route(
+                    "/test",
+                    web::get().to(|| async { HttpResponse::Ok().finish() }),
+                ),
+        )
+        .await;
+        let req = test::TestRequest::get()
+            .uri("/test")
+            .insert_header((http::header::ORIGIN, "http://localhost:8081"))
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .map(|v| v.to_str().unwrap()),
+            Some("http://localhost:8081"),
+        );
+    }
 }
