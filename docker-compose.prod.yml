@@ -1,0 +1,35 @@
+# Production Docker Compose Override
+# Usage: docker-compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# This file removes development-only services and configures for production:
+# - Uses internal networking only (no localhost ports exposed)
+# - Requires external reverse proxy for UI access
+# - Enables stricter security settings
+
+version: '3.8'
+
+services:
+  # Remove port exposures - use reverse proxy instead
+  db:
+    ports: []
+  
+  control-api:
+    ports: []
+    environment:
+      - RUST_LOG=warn
+  
+  ui:
+    ports: []
+  
+  prometheus:
+    ports: []
+  
+  grafana:
+    ports: []
+  
+  # Add TLS termination via reverse proxy (nginx, traefik, etc.)
+  # Example nginx config would handle:
+  # - HTTPS termination
+  # - Rate limiting
+  # - WebSocket support for UI
+  # - Access logging
