@@ -8,6 +8,9 @@ import AdminUsers from './pages/Admin/Users';
 import AdminServers from './pages/Admin/Servers';
 import AdminAgents from './pages/Admin/Agents';
 import AdminGeoRules from './pages/Admin/GeoRules';
+import AdminConfigPush from './pages/Admin/ConfigPush';
+import AdminAuditLogs from './pages/Admin/AuditLogs';
+import Records from './pages/Records';
 import UserDashboard from './pages/User';
 import { useAuthStore } from './store';
 
@@ -30,13 +33,15 @@ function AdminRoutes() {
     <Routes>
       <Route path="/" element={<AdminDashboard />} />
       <Route path="/zones" element={<AdminZones />} />
+      <Route path="/zones/:id/records" element={<Records />} />
       <Route path="/users" element={<AdminUsers />} />
       <Route path="/servers" element={<AdminServers />} />
       <Route path="/agents" element={<AdminAgents />} />
       <Route path="/georules" element={<AdminGeoRules />} />
       <Route path="/metrics" element={<AdminDashboard />} />
-      <Route path="/audit" element={<AdminDashboard />} />
+      <Route path="/audit" element={<AdminAuditLogs />} />
       <Route path="/certificates" element={<AdminDashboard />} />
+      <Route path="/config" element={<AdminConfigPush />} />
     </Routes>
   );
 }

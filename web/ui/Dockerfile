@@ -39,11 +39,11 @@ COPY nginx.conf /etc/nginx/nginx.conf
 COPY --from=builder /app/dist /usr/share/nginx/html
 
 # Expose ports
-EXPOSE 8080
+EXPOSE 80
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+    CMD curl -f http://localhost:80/health || exit 1
 
 # Start nginx - runs as root, nginx will handle dropping privileges internally
 CMD ["nginx", "-g", "daemon off;"]

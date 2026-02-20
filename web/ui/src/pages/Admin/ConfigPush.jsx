@@ -1,13 +1,18 @@
 import React from 'react'
-import axios from 'axios'
+import api from '../../api/client'
 
 export default function ConfigPush(){
   const [agentId, setAgentId] = React.useState('')
   const [zoneId, setZoneId] = React.useState('')
   const [result, setResult] = React.useState(null)
 
+  React.useEffect(() => {
+    const token = localStorage.getItem('token')
+    if (token) api.setToken(token)
+  }, [])
+
   const push = async () => {
-    try { const r = await axios.post('/api/v1/config/push', { agent_id: agentId, zone_id: zoneId, zone_config: {} }); setResult(r.data) } catch (e) { alert('Error pushing config') }
+    try { const r = await api.post('/api/v1/config/push', { agent_id: agentId, zone_id: zoneId, zone_config: {} }); setResult(r.data) } catch (e) { alert('Error pushing config') }
   }
 
   return (

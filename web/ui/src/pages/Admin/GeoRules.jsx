@@ -1,6 +1,6 @@
 import React from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import api from '../../api'
+import api from '../../api/client'
 import { Globe, Plus, Trash2, MapPin, Play, ChevronRight } from 'lucide-react'
 
 export default function GeoRules(){

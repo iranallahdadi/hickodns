@@ -1,11 +1,11 @@
 import React from 'react'
-import api from '../../api'
+import api from '../../api/client'
 
 export default function AuditLogs(){
   const [logs, setLogs] = React.useState([])
   const [q, setQ] = React.useState('')
 
-  const load = async ()=>{ try { const r = await api.get('/api/v1/audit'); setLogs(r.data||[]) } catch(e){ console.error(e) } }
+  const load = async ()=>{ try { const r = await api.get('/api/v1/audit/logs'); setLogs(r.data||[]) } catch(e){ console.error(e) } }
   React.useEffect(()=>{ const t=localStorage.getItem('token'); if(t) api.setToken(t); load() }, [])
 
   const exportCSV = ()=>{

@@ -22,9 +22,25 @@ api.interceptors.request.use(
   (error) => Promise.reject(error)
 );
 
-// Response interceptor for error handling
+// Response interceptor for error handling and normalizing responses
 api.interceptors.response.use(
-  (response) => response,
+  (response) => {
+    // Normalize API responses - backend returns inconsistent formats
+    // Some endpoints return direct arrays, some return { success, data, error }
+    // Only unwrap if it has the specific wrapped format (not token responses, etc.)
+    if (response.data && typeof response.data === 'object') {
+      // Check if it's a wrapped response with success/data/error structure
+      // Must have 'success' as a boolean and 'data' field to unwrap
+      if (response.data.success === true && 'data' in response.data && response.data.data !== undefined) {
+        // Return a new response object with data unwrapped
+        return {
+          ...response,
+          data: response.data.data
+        };
+      }
+    }
+    return response;
+  },
   (error) => {
     if (error.response?.status === 401) {
       localStorage.removeItem('token');
@@ -154,6 +170,9 @@ export const setAuthToken = (token) => {
     delete api.defaults.headers.common.Authorization;
   }
 };
+
+// Alias for setToken compatibility
+api.setToken = setAuthToken;
 
 // Helper to get stored token
 export const getAuthToken = () => localStorage.getItem('token');

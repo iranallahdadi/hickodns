@@ -1,9 +1,7 @@
 import axios from 'axios';
 
-console.log("API base:", import.meta.env.VITE_API_BASE);
-
 const api = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE || 'http://localhost:8080'
+  baseURL: import.meta.env.VITE_API_BASE_URL || 'http://localhost:8080'
 });
 
 api.setToken = (token) => {

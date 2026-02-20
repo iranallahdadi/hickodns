@@ -1,6 +1,6 @@
 import React from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import axios from 'axios'
+import api from '../../api/client'
 import { Server, MapPin, Plus, Trash2, RefreshCw, Play, Square, Shield, Clock, FileText, Settings, X, Check, AlertTriangle } from 'lucide-react'
 
 export default function Servers(){
@@ -18,7 +18,7 @@ export default function Servers(){
   const load = async () => {
     setLoading(true)
     try {
-      const r = await axios.get('/api/v1/servers')
+      const r = await api.get('/api/v1/servers')
       setServers(r.data || [])
     } catch (e) { console.error(e) }
     setLoading(false)
@@ -26,7 +26,7 @@ export default function Servers(){
 
   React.useEffect(()=>{ 
     const token = localStorage.getItem('token')
-    if(token) axios.defaults.headers.common['Authorization'] = `Bearer ${token}`
+    if(token) api.setToken(token)
     load() 
   }, [])
 
@@ -62,7 +62,7 @@ export default function Servers(){
       if (editingServer) {
         // Update - for now just recreate
       }
-      await axios.post('/api/v1/servers', form)
+      await api.post('/api/v1/servers', form)
       setShowModal(false)
       load() 
     } catch (e) { alert('Error saving server') }
@@ -71,7 +71,7 @@ export default function Servers(){
   const remove = async (id) => {
     if (!confirm('Delete this server?')) return
     try {
-      // Delete endpoint would need to be added
+      await api.delete(`/api/v1/servers/${id}`)
       load()
     } catch (e) { alert('Error deleting server') }
   }
@@ -79,7 +79,7 @@ export default function Servers(){
   const startDns = async (server) => {
     setStarting(s => ({ ...s, [server.id]: true }))
     try {
-      await axios.post('/api/v1/dns/start', { id: server.id, bind: `${server.address}:${server.port || 53}` })
+      await api.post('/api/v1/dns/start', { id: server.id, bind: `${server.address}:${server.port || 53}` })
       load()
     } catch (e) { console.error(e) }
     setStarting(s => ({ ...s, [server.id]: false }))
@@ -88,7 +88,7 @@ export default function Servers(){
   const stopDns = async (server) => {
     setStarting(s => ({ ...s, [server.id]: true }))
     try {
-      await axios.post('/api/v1/dns/stop', { id: server.id })
+      await api.post('/api/v1/dns/stop', { id: server.id })
       load()
     } catch (e) { console.error(e) }
     setStarting(s => ({ ...s, [server.id]: false }))

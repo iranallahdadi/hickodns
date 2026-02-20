@@ -1,5 +1,5 @@
 import React from 'react'
-import api from '../api'
+import api from '../api/client'
 
 export default function BulkImport({ endpoint, onComplete, accept='text/csv,application/json' }){
   const [file, setFile] = React.useState(null)

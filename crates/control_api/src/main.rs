@@ -337,6 +337,35 @@ async fn logout(req: HttpRequest) -> impl Responder {
     HttpResponse::Ok().json(serde_json::json!({"message": "no active session"}))
 }
 
+async fn get_current_user(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
+    let tok = match auth_from_header(&req, &data.jwt_secret) {
+        Some(t) => t,
+        None => return HttpResponse::Unauthorized().json(serde_json::json!({"error": "unauthorized"})),
+    };
+    
+    let user_id = &tok.claims.sub;
+    match (&*data.db).query_opt(
+        "SELECT id, username, role, created_at FROM users WHERE id = $1",
+        &[user_id]
+    ).await {
+        Ok(Some(row)) => {
+            HttpResponse::Ok().json(serde_json::json!({
+                "id": row.get::<_, String>(0),
+                "username": row.get::<_, String>(1),
+                "role": row.get::<_, String>(2),
+                "createdAt": row.get::<_, String>(3)
+            }))
+        }
+        Ok(None) => {
+            HttpResponse::NotFound().json(serde_json::json!({"error": "user not found"}))
+        }
+        Err(e) => {
+            warn!("get_current_user error: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({"error": "database error"}))
+        }
+    }
+}
+
 async fn create_user(req: web::Json<LoginRequest>, data: web::Data<AppState>) -> impl Responder {
     let username = req.username.trim();
     if username.is_empty() || username.len() < 3 {
@@ -414,6 +443,39 @@ async fn get_user(path: web::Path<String>, data: web::Data<AppState>, req: HttpR
         }
         Err(e) => {
             warn!("get_user error: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({"error": "database error"}))
+        }
+    }
+}
+
+async fn list_users(data: web::Data<AppState>, req: HttpRequest) -> impl Responder {
+    let tok = match auth_from_header(&req, &data.jwt_secret) {
+        Some(t) => t,
+        None => return HttpResponse::Unauthorized().json(serde_json::json!({"error": "unauthorized"})),
+    };
+    
+    // Only admins can list all users
+    if tok.claims.role != "admin" {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "admin role required"}));
+    }
+    
+    match (&*data.db).query(
+        "SELECT id, username, role, created_at FROM users ORDER BY username",
+        &[]
+    ).await {
+        Ok(rows) => {
+            let users: Vec<_> = rows.into_iter().map(|r| {
+                serde_json::json!({
+                    "id": r.get::<_, String>(0),
+                    "username": r.get::<_, String>(1),
+                    "role": r.get::<_, String>(2),
+                    "createdAt": r.get::<_, String>(3)
+                })
+            }).collect();
+            HttpResponse::Ok().json(users)
+        }
+        Err(e) => {
+            warn!("list_users error: {}", e);
             HttpResponse::InternalServerError().json(serde_json::json!({"error": "database error"}))
         }
     }
@@ -577,6 +639,24 @@ async fn create_server(body: web::Json<CreateServerReq>, data: web::Data<AppStat
         Err(e) => {
             warn!("create_server error: {}", e);
             HttpResponse::InternalServerError().finish()
+        }
+    }
+}
+
+async fn delete_server(path: web::Path<String>, data: web::Data<AppState>, req: HttpRequest) -> impl Responder {
+    if let Some(tok) = auth_from_header(&req, &data.jwt_secret) {
+        if tok.claims.role != "admin" {
+            return HttpResponse::Forbidden().json(serde_json::json!({"error": "admin role required"}));
+        }
+    } else {
+        return HttpResponse::Unauthorized().json(serde_json::json!({"error": "unauthorized"}));
+    }
+    let server_id = path.into_inner();
+    match (&*data.db).execute("DELETE FROM servers WHERE id = $1", &[&server_id]).await {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"success": true})),
+        Err(e) => {
+            warn!("delete_server error: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({"error": "failed to delete server"}))
         }
     }
 }
@@ -955,6 +1035,20 @@ async fn list_georules(data: web::Data<FullState>, req: HttpRequest) -> impl Res
     let rows = (&*data.inner.db).query("SELECT id::text, zone_id::text, match_type, match_value, target FROM georules", &[]).await.unwrap_or_default();
     let out: Vec<_> = rows.into_iter().map(|r| serde_json::json!({"id": r.get::<usize, String>(0), "zone_id": r.get::<usize, String>(1), "match_type": r.get::<usize, String>(2), "match_value": r.get::<usize, String>(3), "target": r.get::<usize, String>(4)})).collect();
     HttpResponse::Ok().json(out)
+}
+
+async fn delete_georule(path: web::Path<String>, data: web::Data<FullState>, req: HttpRequest) -> impl Responder {
+    if auth_from_header(&req, &data.inner.jwt_secret).is_none() {
+        return HttpResponse::Unauthorized().json(serde_json::json!({"error": "unauthorized"}));
+    }
+    let rule_id = path.into_inner();
+    match (&*data.inner.db).execute("DELETE FROM georules WHERE id = $1", &[&rule_id]).await {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"success": true})),
+        Err(e) => {
+            warn!("delete_georule error: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({"error": "failed to delete rule"}))
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1611,8 +1705,21 @@ async fn main() -> std::io::Result<()> {
     env_logger::init();
     info!("Starting control API...");
 
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "host=db user=postgres password=password dbname=hickory".to_string());
-    let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "replace_with_a_super_secret".to_string());
+    // Required environment variables for production
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL environment variable must be set");
+    let jwt_secret = std::env::var("JWT_SECRET")
+        .expect("JWT_SECRET environment variable must be set");
+    
+    // Validate JWT_SECRET is sufficiently long for security
+    if jwt_secret.len() < 32 {
+        panic!("JWT_SECRET must be at least 32 characters for production security");
+    }
+
+    // CORS origins - can be comma-separated list or use ALLOWED_ORIGINS env var
+    let allowed_origins = std::env::var("ALLOWED_ORIGINS")
+        .unwrap_or_else(|_| "http://localhost:3000,http://localhost:5173".to_string());
+    let cors_origins: Vec<&str> = allowed_origins.split(',').map(|s| s.trim()).collect();
 
     let (client, connection) = tokio_postgres::connect(&database_url, NoTls).await.expect("cannot connect to db");
     // spawn connection driver
@@ -1675,16 +1782,26 @@ async fn main() -> std::io::Result<()> {
 
     let app_data = web::Data::new(app_state.clone());
     let full_data = web::Data::new(full_state.clone());
+    
+    // Build CORS with allowed origins from environment
+    let cors_origins = std::env::var("ALLOWED_ORIGINS")
+        .unwrap_or_else(|_| "http://localhost:3000,http://localhost:5173".to_string());
 
-        HttpServer::new(move || {
-            let cors = Cors::default()
-                .allowed_origin("http://localhost:3000")
-                .allowed_origin("http://localhost:5173")
-                .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
-                .allowed_headers(vec!["Authorization", "Content-Type"])
-                .max_age(3600);
-            
-            App::new()
+    HttpServer::new(move || {
+        // Build CORS inside closure (can't be cloned)
+        let mut cors = Cors::default()
+            .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+            .allowed_headers(vec!["Authorization", "Content-Type"])
+            .max_age(3600);
+        
+        for origin in cors_origins.split(',') {
+            let o = origin.trim();
+            if !o.is_empty() {
+                cors = cors.allowed_origin(o);
+            }
+        }
+        
+        App::new()
                 .wrap(cors)
                 .wrap(prometheus.clone())
                 .app_data(app_data.clone())
@@ -1694,7 +1811,9 @@ async fn main() -> std::io::Result<()> {
             // Auth
             .route("/api/v1/auth/login", web::post().to(login))
             .route("/api/v1/auth/logout", web::post().to(logout))
+            .route("/api/v1/auth/me", web::get().to(get_current_user))
             // Users
+            .route("/api/v1/users", web::get().to(list_users))
             .route("/api/v1/users", web::post().to(create_user))
             .route("/api/v1/users/{id}", web::get().to(get_user))
             .route("/api/v1/users/{id}", web::put().to(update_user))
@@ -1702,6 +1821,7 @@ async fn main() -> std::io::Result<()> {
             // Servers
             .route("/api/v1/servers", web::get().to(list_servers))
             .route("/api/v1/servers", web::post().to(create_server))
+            .route("/api/v1/servers/{id}", web::delete().to(delete_server))
             // Zones
             .route("/api/v1/zones", web::get().to(list_zones))
             .route("/api/v1/zones", web::post().to(create_zone))
@@ -1728,6 +1848,7 @@ async fn main() -> std::io::Result<()> {
             // GeoRules
             .route("/api/v1/georules", web::post().to(create_georule))
             .route("/api/v1/georules", web::get().to(list_georules))
+            .route("/api/v1/georules/{id}", web::delete().to(delete_georule))
             .route("/api/v1/georules/resolve", web::post().to(resolve_by_geo))
             // Config Push
             .route("/api/v1/config/push", web::post().to(push_config_to_agents))

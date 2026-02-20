@@ -20,7 +20,7 @@ import {
   Pause
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
-import api from '../../api';
+import api from '../../api/client';
 import { LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 
 const StatCard = ({ icon: Icon, label, value, trend, color = 'primary', delay = 0, onClick }) => {
@@ -181,14 +181,14 @@ export default function Dashboard() {
     setLoading(true);
     try {
       const [zonesRes, serversRes, agentsRes, dnsStatusRes] = await Promise.all([
-        api.get('/api/v1/zones').catch(() => ({ data: { data: [] } })),
+        api.get('/api/v1/zones').catch(() => ({ data: [] })),
         api.get('/api/v1/servers').catch(() => ({ data: [] })),
         api.get('/api/v1/agents').catch(() => ({ data: [] })),
         api.get('/api/v1/dns/status').catch(() => ({ data: { servers: [] } }))
       ]);
       
       let recordCount = 0;
-      const zones = zonesRes.data?.data || [];
+      const zones = zonesRes.data || [];
       for (const zone of zones.slice(0, 3)) {
         try {
           const recordsRes = await api.get(`/api/v1/zones/${zone.id}/records`);

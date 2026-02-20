@@ -1,6 +1,6 @@
 import React from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import api from '../../api'
+import api from '../../api/client'
 import Modal from '../../components/Modal'
 import SearchInput from '../../components/SearchInput'
 import { Users as UsersIcon, Plus, Edit2, Trash2, Shield, Mail, User } from 'lucide-react'
@@ -10,7 +10,7 @@ export default function Users(){
   const [q, setQ] = React.useState('')
   const [open, setOpen] = React.useState(false)
   const [editing, setEditing] = React.useState(null)
-  const [form, setForm] = React.useState({ username:'', email:'', role:'user' })
+  const [form, setForm] = React.useState({ username:'', email:'', role:'user', password:'' })
   const [loading, setLoading] = React.useState(false)
 
   const load = async () => {
@@ -23,16 +23,26 @@ export default function Users(){
   }
   React.useEffect(()=>{ const t=localStorage.getItem('token'); if(t) api.setToken(t); load() }, [])
 
-  const openCreate = ()=>{ setForm({ username:'', email:'', role:'user' }); setEditing(null); setOpen(true) }
-  const openEdit = (u)=>{ setForm({ username:u.username, email:u.email, role:u.role }); setEditing(u); setOpen(true) }
+  const openCreate = ()=>{ setForm({ username:'', email:'', role:'user', password:'' }); setEditing(null); setOpen(true) }
+  const openEdit = (u)=>{ setForm({ username:u.username, email:u.email || '', role:u.role, password:'' }); setEditing(u); setOpen(true) }
 
   const save = async ()=>{
     try {
-      if (editing) await api.put(`/api/v1/users/${editing.id}`, form)
-      else await api.post('/api/v1/users', form)
+      if (editing) {
+        // For editing, only update fields that are provided
+        const updateData = { username: form.username, role: form.role }
+        await api.put(`/api/v1/users/${editing.id}`, updateData)
+      } else {
+        // For creating, password is required
+        if (!form.password || form.password.length < 8) {
+          alert('Password must be at least 8 characters')
+          return
+        }
+        await api.post('/api/v1/users', { username: form.username, password: form.password, role: form.role })
+      }
       setOpen(false)
       load()
-    } catch(e){ alert('Save failed') }
+    } catch(e){ alert('Save failed: ' + (e.response?.data?.error || e.message)) }
   }
 
   const remove = async (id)=>{ if(!confirm('Delete user?')) return; try { await api.delete(`/api/v1/users/${id}`); load() } catch(e){ alert('Delete failed') } }
@@ -162,15 +172,18 @@ export default function Users(){
                   onChange={e=>setForm({...form, username:e.target.value})} 
                 />
               </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">Email</label>
-                <input 
-                  className="w-full border border-gray-300 rounded-lg px-4 py-2 focus:ring-2 focus:ring-purple-500 focus:border-transparent" 
-                  placeholder="email" 
-                  value={form.email} 
-                  onChange={e=>setForm({...form, email:e.target.value})} 
-                />
-              </div>
+              {!editing && (
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Password</label>
+                  <input 
+                    type="password"
+                    className="w-full border border-gray-300 rounded-lg px-4 py-2 focus:ring-2 focus:ring-purple-500 focus:border-transparent" 
+                    placeholder="min 8 characters" 
+                    value={form.password} 
+                    onChange={e=>setForm({...form, password:e.target.value})} 
+                  />
+                </div>
+              )}
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">Role</label>
                 <select 

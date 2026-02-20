@@ -1,10 +1,10 @@
 import React from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import api from '../api'
+import api from '../api/client'
 import BulkImport from '../components/BulkImport'
 import Notifications from '../components/Notifications'
 import { useParams } from 'react-router-dom'
-import { Record, Plus, Trash2, Download, RefreshCw, FileText } from 'lucide-react'
+import { FileText, Plus, Trash2, Download, RefreshCw } from 'lucide-react'
 
 export default function Records(){
   const { id } = useParams()
@@ -75,10 +75,10 @@ export default function Records(){
         <div className="flex items-center justify-between mb-6">
           <div className="flex items-center space-x-3">
             <div className="p-2 bg-orange-100 rounded-lg">
-              <Record className="w-6 h-6 text-orange-600" />
+              <FileText className="w-6 h-6 text-orange-600" />
             </div>
             <div>
-              <h3 className="text-xl font-bold text-gray-800">DNS Records</h3>
+              <h3 className="text-xl font-bold text-gray-800">DNS FileTexts</h3>
               <p className="text-sm text-gray-500">Zone: {zoneId?.substring(0,8)}...</p>
             </div>
           </div>
@@ -135,7 +135,7 @@ export default function Records(){
               onClick={create}
             >
               <Plus className="w-5 h-5" />
-              <span>Add Record</span>
+              <span>Add FileText</span>
             </button>
           </div>
         </div>
@@ -170,7 +170,7 @@ export default function Records(){
       >
         {records.length === 0 ? (
           <div className="p-12 text-center">
-            <Record className="w-16 h-16 text-gray-300 mx-auto mb-4" />
+            <FileText className="w-16 h-16 text-gray-300 mx-auto mb-4" />
             <p className="text-gray-500">No records in this zone yet</p>
           </div>
         ) : (
