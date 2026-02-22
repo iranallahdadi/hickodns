@@ -407,7 +407,7 @@ async fn migrate_db(client: &tokio_postgres::Client) -> Result<(), tokio_postgre
             let argon2 = Argon2::default();
             let password_hash = argon2.hash_password(b"admin123", &salt).unwrap().to_string();
             if let Err(e) = client.execute(
-                "INSERT INTO users (id, username, password_hash, role) VALUES ($1, $2, $3, $4)",
+                "INSERT INTO users (id, username, password_hash, role) VALUES ($1::text::uuid, $2, $3, $4)",
                 &[&Uuid::new_v4().to_string(), &"admin", &password_hash, &"admin"]
             ).await {
                 warn!("Failed to create default admin user: {}", e);
@@ -441,33 +441,35 @@ async fn login(body: web::Json<LoginRequest>, data: web::Data<AppState>) -> impl
     }
     
     if let Ok(row) = (&*data.db).query_one(
-        "SELECT id::text, password_hash, role FROM users WHERE username = $1",
+        "SELECT CAST(id AS varchar), password_hash, role FROM users WHERE username = $1",
         &[&username]
     ).await {
-        let id_str: String = row.get(0);
-        let id = id_str.clone();
-        let password_hash: String = row.get(1);
-        let role: Option<String> = row.get(2);
+        match (row.try_get::<_, String>(0), row.try_get::<_, String>(1), row.try_get::<_, Option<String>>(2)) {
+            (Ok(id_str), Ok(password_hash), Ok(role)) => {
+                let id = id_str.clone();
         
-        if let Ok(hash) = PasswordHash::new(&password_hash) {
-            if Argon2::default().verify_password(body.password.as_bytes(), &hash).is_ok() {
-                let exp = (chrono::Utc::now() + chrono::Duration::hours(8)).timestamp() as usize;
-                let claims = Claims { 
-                    sub: id.to_string(), 
-                    role: role.clone().unwrap_or_else(|| "user".to_string()), 
-                    exp 
-                };
-                
-                match encode(&Header::default(), &claims, &EncodingKey::from_secret(data.jwt_secret.as_bytes())) {
-                    Ok(token) => {
-                        return HttpResponse::Ok().json(LoginResponse { token, expires_in: 28800 });
-                    }
-                    Err(e) => {
-                        warn!("JWT encode error: {}", e);
-                        return HttpResponse::InternalServerError().finish();
+                if let Ok(hash) = PasswordHash::new(&password_hash) {
+                    if Argon2::default().verify_password(body.password.as_bytes(), &hash).is_ok() {
+                        let exp = (chrono::Utc::now() + chrono::Duration::hours(8)).timestamp() as usize;
+                        let claims = Claims { 
+                            sub: id.to_string(), 
+                            role: role.clone().unwrap_or_else(|| "user".to_string()), 
+                            exp 
+                        };
+                        
+                        match encode(&Header::default(), &claims, &EncodingKey::from_secret(data.jwt_secret.as_bytes())) {
+                            Ok(token) => {
+                                return HttpResponse::Ok().json(LoginResponse { token, expires_in: 28800 });
+                            }
+                            Err(e) => {
+                                warn!("JWT encode error: {}", e);
+                                return HttpResponse::InternalServerError().finish();
+                            }
+                        }
                     }
                 }
             }
+            _ => {}
         }
     }
     HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid credentials"}))
@@ -493,17 +495,22 @@ async fn get_current_user(req: HttpRequest, data: web::Data<AppState>) -> impl R
     let user_id = &tok.claims.sub;
     // users.id is a UUID column; compare text representation to avoid UUID param type issues
     match (&*data.db).query_opt(
-        "SELECT id::text, username, role, created_at::text FROM users WHERE id::text = $1",
+        "SELECT CAST(id AS varchar), username, role, to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') FROM users WHERE CAST(id AS varchar) = $1",
         &[user_id]
     ).await {
         Ok(Some(row)) => {
-            // created_at selected as text so we can safely return it
-            HttpResponse::Ok().json(serde_json::json!({
-                "id": row.get::<_, String>(0),
-                "username": row.get::<_, String>(1),
-                "role": row.get::<_, String>(2),
-                "createdAt": row.get::<_, Option<String>>(3)
-            }))
+            // Use try_get to avoid panics
+            match (row.try_get::<_, String>(0), row.try_get::<_, String>(1), row.try_get::<_, String>(2), row.try_get::<_, Option<String>>(3)) {
+                (Ok(id), Ok(username), Ok(role), Ok(created_at)) => {
+                    HttpResponse::Ok().json(serde_json::json!({
+                        "id": id,
+                        "username": username,
+                        "role": role,
+                        "createdAt": created_at
+                    }))
+                }
+                _ => HttpResponse::InternalServerError().json(serde_json::json!({"error": "database deserialization error"}))
+            }
         }
         Ok(None) => {
             HttpResponse::NotFound().json(serde_json::json!({"error": "user not found"}))
@@ -552,7 +559,7 @@ async fn create_user(req: web::Json<LoginRequest>, data: web::Data<AppState>) ->
     let role = "user";
     
     match (&*data.db).execute(
-        "INSERT INTO users (id, username, password_hash, role) VALUES ($1, $2, $3, $4)",
+        "INSERT INTO users (id, username, password_hash, role) VALUES ($1::text::uuid, $2, $3, $4)",
         &[&id_str, &username, &password_hash, &role]
     ).await {
         Ok(_) => {
@@ -594,7 +601,7 @@ async fn get_user(path: web::Path<String>, data: web::Data<AppState>, req: HttpR
     }
     
     match (&*data.db).query(
-        "SELECT id::text, username, role, created_at::text FROM users WHERE id::text = $1",
+        "SELECT CAST(id AS varchar), username, role, to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') FROM users WHERE CAST(id AS varchar) = $1",
         &[&user_id]
     ).await {
         Ok(rows) => {
@@ -602,16 +609,17 @@ async fn get_user(path: web::Path<String>, data: web::Data<AppState>, req: HttpR
                 return HttpResponse::NotFound().json(serde_json::json!({"error": "user not found"}));
             }
             let row = &rows[0];
-            let id: String = row.get(0);
-            let username: String = row.get(1);
-            let role: String = row.get(2);
-            let created_at: String = row.get(3);
-            HttpResponse::Ok().json(serde_json::json!({
-                "id": id,
-                "username": username,
-                "role": role,
-                "createdAt": created_at
-            }))
+            if let (Ok(id), Ok(username), Ok(role), Ok(created_at)) = 
+                (row.try_get::<_, String>(0), row.try_get::<_, String>(1), row.try_get::<_, String>(2), row.try_get::<_, Option<String>>(3)) {
+                HttpResponse::Ok().json(serde_json::json!({
+                    "id": id,
+                    "username": username,
+                    "role": role,
+                    "createdAt": created_at
+                }))
+            } else {
+                HttpResponse::InternalServerError().json(serde_json::json!({"error": "database deserialization error"}))
+            }
         }
         Err(e) => {
             warn!("get_user error: {}", e);
@@ -641,18 +649,27 @@ async fn list_users(data: web::Data<AppState>, req: HttpRequest) -> impl Respond
     }
     
     match (&*data.db).query(
-        "SELECT id, username, role, to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') as created_at_str FROM users ORDER BY username",
+        "SELECT CAST(id AS varchar), username, role, to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') as created_at_str FROM users ORDER BY username",
         &[]
     ).await {
         Ok(rows) => {
-            let users: Vec<_> = rows.into_iter().map(|r| {
-                let id: uuid::Uuid = r.get(0);
-                serde_json::json!({
-                    "id": id.to_string(),
-                    "username": r.get::<_, String>(1),
-                    "role": r.get::<_, String>(2),
-                    "createdAt": r.get::<_, Option<String>>(3).unwrap_or_else(|| String::from(""))
-                })
+            let users: Vec<_> = rows.into_iter().filter_map(|r| {
+                let id_result = r.try_get::<_, String>(0);
+                let username_result = r.try_get::<_, String>(1);
+                let role_result = r.try_get::<_, String>(2);
+                let created_at_result = r.try_get::<_, Option<String>>(3);
+                
+                match (id_result, username_result, role_result, created_at_result) {
+                    (Ok(id), Ok(username), Ok(role), Ok(created_at)) => {
+                        Some(serde_json::json!({
+                            "id": id,
+                            "username": username,
+                            "role": role,
+                            "createdAt": created_at.unwrap_or_else(|| String::from(""))
+                        }))
+                    }
+                    _ => None  // Skip rows with deserialization errors
+                }
             }).collect();
             HttpResponse::Ok().json(users)
         }
@@ -682,7 +699,7 @@ async fn update_user(path: web::Path<String>, body: web::Json<UpdateUserReq>, da
             return HttpResponse::BadRequest().json(serde_json::json!({"error": "username must be at least 3 characters"}));
         }
         match (&*data.db).execute(
-            "UPDATE users SET username = $1, updated_at = now() WHERE id::text = $2",
+            "UPDATE users SET username = $1, updated_at = now() WHERE CAST(id AS varchar) = $2",
             &[username, &user_id]
         ).await {
             Ok(result) => {
@@ -702,7 +719,7 @@ async fn update_user(path: web::Path<String>, body: web::Json<UpdateUserReq>, da
         }
     } else if let Some(role) = &body.role {
         match (&*data.db).execute(
-            "UPDATE users SET role = $1, updated_at = now() WHERE id::text = $2",
+            "UPDATE users SET role = $1, updated_at = now() WHERE CAST(id AS varchar) = $2",
             &[role, &user_id]
         ).await {
             Ok(result) => {
@@ -734,7 +751,7 @@ async fn delete_user(path: web::Path<String>, data: web::Data<AppState>, req: Ht
         return HttpResponse::BadRequest().json(serde_json::json!({"error": "cannot delete yourself"}));
     }
     
-    match (&*data.db).execute("DELETE FROM users WHERE id::text = $1", &[&user_id]).await {
+    match (&*data.db).execute("DELETE FROM users WHERE CAST(id AS varchar) = $1", &[&user_id]).await {
         Ok(result) => {
             if result > 0 {
                 HttpResponse::Ok().json(serde_json::json!({"message": "user deleted"}))
@@ -771,21 +788,21 @@ async fn list_servers(data: web::Data<AppState>, req: HttpRequest) -> impl Respo
     
     // Query servers
     match (&*data.db).query(
-        "SELECT id::text, name, address, port, region, enabled, dnssec, enable_logging, max_cache_ttl, min_cache_ttl FROM servers ORDER BY name", 
+        "SELECT CAST(id AS varchar), name, address, port, region, enabled, dnssec, enable_logging, max_cache_ttl, min_cache_ttl FROM servers ORDER BY name", 
         &[]
     ).await {
         Ok(rows) => {
             let servers: Vec<ServerInfo> = rows.into_iter().map(|r| ServerInfo {
-                id: r.get(0),
-                name: r.get(1),
-                address: r.get(2),
-                port: r.get(3),
-                region: r.get(4),
-                enabled: r.get(5),
-                dnssec: r.get(6),
-                enable_logging: r.get(7),
-                max_cache_ttl: r.get(8),
-                min_cache_ttl: r.get(9),
+                id: r.try_get(0).unwrap_or_default(),
+                name: r.try_get(1).unwrap_or_default(),
+                address: r.try_get(2).unwrap_or_default(),
+                port: r.try_get(3).unwrap_or_default(),
+                region: r.try_get(4).ok().flatten(),
+                enabled: r.try_get(5).unwrap_or_default(),
+                dnssec: r.try_get(6).unwrap_or_default(),
+                enable_logging: r.try_get(7).unwrap_or_default(),
+                max_cache_ttl: r.try_get(8).unwrap_or_default(),
+                min_cache_ttl: r.try_get(9).unwrap_or_default(),
                 status: None,
             }).collect();
             HttpResponse::Ok().json(servers)
@@ -857,7 +874,7 @@ async fn create_server(body: web::Json<CreateServerReq>, data: web::Data<AppStat
     let min_cache_ttl = body.min_cache_ttl.unwrap_or(60);
     
     match (&*data.db).execute(
-        "INSERT INTO servers (id, name, address, port, region, enabled, dnssec, enable_logging, max_cache_ttl, min_cache_ttl) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)", 
+        "INSERT INTO servers (id, name, address, port, region, enabled, dnssec, enable_logging, max_cache_ttl, min_cache_ttl) VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10)", 
         &[&id_str, &body.name, &body.address, &port, &body.region, &enabled, &dnssec, &enable_logging, &max_cache_ttl, &min_cache_ttl]
     ).await {
         Ok(_) => {
@@ -887,7 +904,7 @@ async fn delete_server(path: web::Path<String>, data: web::Data<AppState>, req: 
         return HttpResponse::Unauthorized().json(serde_json::json!({"error": "unauthorized"}));
     }
     let server_id = path.into_inner();
-    match (&*data.db).execute("DELETE FROM servers WHERE id::text = $1", &[&server_id]).await {
+    match (&*data.db).execute("DELETE FROM servers WHERE CAST(id AS varchar) = $1", &[&server_id]).await {
         Ok(_) => HttpResponse::Ok().json(serde_json::json!({"success": true})),
         Err(e) => {
             warn!("delete_server error: {}", e);
@@ -943,7 +960,7 @@ async fn agent_register(body: web::Json<AgentRegistration>, data: web::Data<AppS
     };
 
     match (&*data.db).execute(
-        "INSERT INTO agents (id, name, addr, token_hash) VALUES ($1, $2, $3, $4)",
+        "INSERT INTO agents (id, name, addr, token_hash) VALUES ($1::text::uuid, $2, $3, $4)",
         &[&id_str, &body.name, &body.addr, &token_hash]
     ).await {
         Ok(_) => {
@@ -972,13 +989,13 @@ async fn agent_heartbeat(body: web::Json<AgentRegistration>, data: web::Data<App
     let token = token.unwrap();
 
     // find agent by addr
-    if let Ok(row) = (&*data.db).query_one("SELECT id::text, token_hash FROM agents WHERE addr = $1", &[&body.addr]).await {
-        let id_str: String = row.get(0);
-        let token_hash: Option<String> = row.get(1);
+    if let Ok(row) = (&*data.db).query_one("SELECT CAST(id AS varchar), token_hash FROM agents WHERE addr = $1", &[&body.addr]).await {
+        let id_str: String = row.try_get(0).unwrap_or_default();
+        let token_hash: Option<String> = row.try_get(1).ok().flatten();
         if let Some(th) = token_hash {
             if let Ok(ph) = PasswordHash::new(&th) {
                 if Argon2::default().verify_password(token.as_bytes(), &ph).is_ok() {
-                    let res = (&*data.db).execute("UPDATE agents SET last_heartbeat = now() WHERE id::text = $1", &[&id_str]).await;
+                    let res = (&*data.db).execute("UPDATE agents SET last_heartbeat = now() WHERE CAST(id AS varchar) = $1", &[&id_str]).await;
                     return match res {
                         Ok(_) => HttpResponse::Ok().finish(),
                         Err(e) => { warn!("agent_heartbeat error: {}", e); HttpResponse::InternalServerError().finish() }
@@ -1000,14 +1017,14 @@ async fn agent_get_config(path: web::Path<String>, data: web::Data<AppState>, re
     }
     let token = token.unwrap();
 
-    if let Ok(row) = (&*data.db).query_one("SELECT token_hash FROM agents WHERE id::text = $1", &[&agent_id]).await {
-        let token_hash: Option<String> = row.get(0);
+    if let Ok(row) = (&*data.db).query_one("SELECT token_hash FROM agents WHERE CAST(id AS varchar) = $1", &[&agent_id]).await {
+        let token_hash: Option<String> = row.try_get(0).ok().flatten();
         if let Some(th) = token_hash {
             if let Ok(ph) = PasswordHash::new(&th) {
                 if Argon2::default().verify_password(token.as_bytes(), &ph).is_ok() {
                     // In production, return signed config blob. For now, return zone list assigned to control plane.
-                    let zones = (&*data.db).query("SELECT id::text, domain FROM zones", &[]).await.unwrap_or_default();
-                    let z: Vec<_> = zones.into_iter().map(|r| serde_json::json!({"id": r.get::<usize, String>(0), "domain": r.get::<usize, String>(1)})).collect();
+                    let zones = (&*data.db).query("SELECT CAST(id AS varchar), domain FROM zones", &[]).await.unwrap_or_default();
+                    let z: Vec<_> = zones.into_iter().map(|r| serde_json::json!({"id": r.try_get::<_, String>(0).unwrap_or_default(), "domain": r.try_get::<_, String>(1).unwrap_or_default()})).collect();
                     return HttpResponse::Ok().json(serde_json::json!({"zones": z}));
                 }
             }
@@ -1032,7 +1049,7 @@ async fn rotate_agent_token(path: web::Path<String>, data: web::Data<AppState>, 
     let salt = SaltString::generate(&mut OsRng);
     let argon2 = Argon2::default();
     let token_hash = argon2.hash_password(token_plain.as_bytes(), &salt).unwrap().to_string();
-    let res = (&*data.db).execute("UPDATE agents SET token_hash = $1 WHERE id::text = $2", &[&token_hash, &agent_id]).await;
+    let res = (&*data.db).execute("UPDATE agents SET token_hash = $1 WHERE CAST(id AS varchar) = $2", &[&token_hash, &agent_id]).await;
     match res {
         Ok(r) => if r == 0 { HttpResponse::NotFound().finish() } else { HttpResponse::Ok().json(serde_json::json!({"token": token_plain})) },
         Err(e) => { warn!("rotate_agent_token error: {}", e); HttpResponse::InternalServerError().finish() }
@@ -1060,15 +1077,15 @@ async fn list_agents(data: web::Data<AppState>, req: HttpRequest) -> impl Respon
     
     // Query agents
     match (&*data.db).query(
-        "SELECT id::text, name, addr, EXTRACT(EPOCH FROM last_heartbeat) as epoch FROM agents ORDER BY name",
+        "SELECT CAST(id AS varchar), name, addr, EXTRACT(EPOCH FROM last_heartbeat) as epoch FROM agents ORDER BY name",
         &[]
     ).await {
         Ok(rows) => {
             let agents: Vec<_> = rows.into_iter().map(|r| {
-                let id: String = r.get(0);
-                let name: String = r.get(1);
-                let addr: String = r.get(2);
-                let epoch: f64 = r.get(3);
+                let id: String = r.try_get(0).unwrap_or_default();
+                let name: String = r.try_get(1).unwrap_or_default();
+                let addr: String = r.try_get(2).unwrap_or_default();
+                let epoch: f64 = r.try_get(3).unwrap_or(0.0);
                 let last_dt = chrono::Utc.timestamp_opt(epoch as i64, (epoch.fract() * 1e9) as u32).single().unwrap_or(chrono::Utc::now());
                 let age = chrono::Utc::now().signed_duration_since(last_dt).num_seconds();
                 let online = age < 120;
@@ -1119,18 +1136,18 @@ async fn start_dns_server(body: web::Json<StartDnsReq>, data: web::Data<FullStat
     }
 
     // write zone files from DB
-    let zones = (&*data.inner.db).query("SELECT id::text, domain FROM zones", &[]).await.unwrap_or_default();
+    let zones = (&*data.inner.db).query("SELECT CAST(id AS varchar), domain FROM zones", &[]).await.unwrap_or_default();
     let mut zone_configs = String::new();
     
     for z in zones.into_iter() {
-        let zid: String = z.get(0);
-        let domain: String = z.get(1);
+        let zid: String = z.try_get(0).unwrap_or_default();
+        let domain: String = z.try_get(1).unwrap_or_default();
         let fname = format!("{}/{}.zone", config_dir, domain.replace('.', "_").replace("-", "_"));
         if let Ok(mut f) = std::fs::File::create(&fname) {
             use std::io::Write;
             let soa = format!("@ 3600 IN SOA ns.{} hostmaster.{} 1 3600 3600 604800 3600\n", domain, domain);
             let _ = f.write_all(soa.as_bytes());
-            let recs = (&*data.inner.db).query("SELECT name, type, value, ttl FROM records WHERE zone_id::text = $1", &[&zid]).await.unwrap_or_default();
+            let recs = (&*data.inner.db).query("SELECT name, type, value, ttl FROM records WHERE CAST(zone_id AS varchar) = $1", &[&zid]).await.unwrap_or_default();
             for r in recs {
                 let name: String = r.get(0);
                 let typ: String = r.get(1);
@@ -1314,7 +1331,7 @@ async fn create_georule(body: web::Json<CreateGeoRuleReq>, data: web::Data<FullS
     };
     let id_str = id.to_string();
     let zone_str = zone_uuid.to_string();
-    let res = (&*data.inner.db).execute("INSERT INTO georules (id, zone_id, match_type, match_value, target) VALUES ($1, $2, $3, $4, $5)", &[&id_str, &zone_str, &body.match_type, &body.match_value, &body.target]).await;
+    let res = (&*data.inner.db).execute("INSERT INTO georules (id, zone_id, match_type, match_value, target) VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5)", &[&id_str, &zone_str, &body.match_type, &body.match_value, &body.target]).await;
     match res {
         Ok(_) => HttpResponse::Created().json(serde_json::json!({"id": id.to_string()})),
         Err(e) => { warn!("create_georule error: {}", e); HttpResponse::InternalServerError().finish() }
@@ -1323,8 +1340,8 @@ async fn create_georule(body: web::Json<CreateGeoRuleReq>, data: web::Data<FullS
 
 async fn list_georules(data: web::Data<FullState>, req: HttpRequest) -> impl Responder {
     if auth_from_header(&req, &data.inner.jwt_secret).is_none() { return HttpResponse::Unauthorized().finish(); }
-    let rows = (&*data.inner.db).query("SELECT id::text, zone_id::text, match_type, match_value, target FROM georules", &[]).await.unwrap_or_default();
-    let out: Vec<_> = rows.into_iter().map(|r| serde_json::json!({"id": r.get::<usize, String>(0), "zone_id": r.get::<usize, String>(1), "match_type": r.get::<usize, String>(2), "match_value": r.get::<usize, String>(3), "target": r.get::<usize, String>(4)})).collect();
+    let rows = (&*data.inner.db).query("SELECT CAST(id AS varchar), CAST(zone_id AS varchar), match_type, match_value, target FROM georules", &[]).await.unwrap_or_default();
+    let out: Vec<_> = rows.into_iter().map(|r| serde_json::json!({"id": r.try_get::<_, String>(0).unwrap_or_default(), "zone_id": r.try_get::<_, String>(1).unwrap_or_default(), "match_type": r.try_get::<_, String>(2).unwrap_or_default(), "match_value": r.try_get::<_, String>(3).unwrap_or_default(), "target": r.try_get::<_, String>(4).unwrap_or_default()})).collect();
     HttpResponse::Ok().json(out)
 }
 
@@ -1333,7 +1350,7 @@ async fn delete_georule(path: web::Path<String>, data: web::Data<FullState>, req
         return HttpResponse::Unauthorized().json(serde_json::json!({"error": "unauthorized"}));
     }
     let rule_id = path.into_inner();
-    match (&*data.inner.db).execute("DELETE FROM georules WHERE id::text = $1", &[&rule_id]).await {
+    match (&*data.inner.db).execute("DELETE FROM georules WHERE CAST(id AS varchar) = $1", &[&rule_id]).await {
         Ok(_) => HttpResponse::Ok().json(serde_json::json!({"success": true})),
         Err(e) => {
             warn!("delete_georule error: {}", e);
@@ -1361,13 +1378,13 @@ async fn list_zones(data: web::Data<AppState>, req: HttpRequest) -> impl Respond
     // Query zones based on role
     let query_result = if tok.claims.role == "admin" {
         (&*data.db).query(
-            "SELECT id::text, domain, COALESCE(owner::text, '') as owner, zone_type, created_at::text FROM zones ORDER BY domain",
+            "SELECT CAST(id AS varchar), domain, COALESCE(CAST(owner AS varchar), '') as owner, zone_type, created_at::text FROM zones ORDER BY domain",
             &[]
         ).await
     } else {
         let owner_str = tok.claims.sub.clone();
         (&*data.db).query(
-            "SELECT id::text, domain, COALESCE(owner::text, '') as owner, zone_type, created_at::text FROM zones WHERE owner::text = $1 ORDER BY domain",
+            "SELECT CAST(id AS varchar), domain, COALESCE(CAST(owner AS varchar), '') as owner, zone_type, created_at::text FROM zones WHERE CAST(owner AS varchar) = $1 ORDER BY domain",
             &[&owner_str]
         ).await
     };
@@ -1375,11 +1392,11 @@ async fn list_zones(data: web::Data<AppState>, req: HttpRequest) -> impl Respond
     match query_result {
         Ok(rows) => {
             let zones: Vec<ZoneWithOwner> = rows.into_iter().map(|r| ZoneWithOwner {
-                id: r.get(0),
-                domain: r.get(1),
-                owner: r.get(2),
-                zone_type: r.get(3),
-                created_at: r.get(4),
+                id: r.try_get(0).unwrap_or_default(),
+                domain: r.try_get(1).unwrap_or_default(),
+                owner: r.try_get(2).unwrap_or_default(),
+                zone_type: r.try_get(3).unwrap_or_default(),
+                created_at: r.try_get(4).unwrap_or_default(),
             }).collect();
             HttpResponse::Ok().json(ApiResponse { success: true, data: Some(zones), error: None })
         }
@@ -1423,7 +1440,7 @@ async fn create_zone(body: web::Json<CreateZoneReq>, data: web::Data<AppState>, 
     };
     
     match (&*data.db).execute(
-        "INSERT INTO zones (id, domain, owner) VALUES ($1, $2, $3)",
+        "INSERT INTO zones (id, domain, owner) VALUES ($1::text::uuid, $2, $3::text::uuid)",
         &[&zone_id_str, &domain, &owner_uuid_str]
     ).await {
         Ok(_) => {
@@ -1460,7 +1477,7 @@ async fn resolve_by_geo(body: web::Json<GeoResolveRequest>, data: web::Data<Full
     // Fetch georules for this zone from DB
     let rows = (&*data.inner.db)
         .query(
-            "SELECT id::text, match_type, match_value, target FROM georules WHERE zone_id::text = $1",
+            "SELECT CAST(id AS varchar), match_type, match_value, target FROM georules WHERE CAST(zone_id AS varchar) = $1",
             &[&body.zone_id],
         )
         .await
@@ -1469,10 +1486,10 @@ async fn resolve_by_geo(body: web::Json<GeoResolveRequest>, data: web::Data<Full
     let rules: Vec<geodns::GeoRule> = rows
         .into_iter()
         .map(|r| geodns::GeoRule {
-            id: r.get::<usize, String>(0),
-            match_type: r.get::<usize, String>(1),
-            match_value: r.get::<usize, String>(2),
-            target: r.get::<usize, String>(3),
+            id: r.try_get::<_, String>(0).unwrap_or_default(),
+            match_type: r.try_get::<_, String>(1).unwrap_or_default(),
+            match_value: r.try_get::<_, String>(2).unwrap_or_default(),
+            target: r.try_get::<_, String>(3).unwrap_or_default(),
         })
         .collect();
 
@@ -1529,7 +1546,7 @@ async fn push_config_to_agents(
 
     // Fetch agent details from DB
     let rows = (&*data.inner.db)
-        .query("SELECT id::text, addr FROM agents WHERE id::text = $1", &[&body.agent_id])
+        .query("SELECT CAST(id AS varchar), addr FROM agents WHERE CAST(id AS varchar) = $1", &[&body.agent_id])
         .await
         .unwrap_or_default();
 
@@ -1537,7 +1554,7 @@ async fn push_config_to_agents(
         return HttpResponse::NotFound().body("agent not found");
     }
 
-    let _agent_addr: String = rows[0].get(1);
+    let _agent_addr: String = rows[0].try_get(1).unwrap_or_default();
 
     // In production, this would:
     // 1. Use mTLS to securely connect to agent at agent_addr
@@ -1605,7 +1622,7 @@ async fn push_config_to_agents(
         // Check zone ownership
         let zone_id_str = zone_id.to_string();
         let owner_check = (&*data.db).query_opt(
-            "SELECT owner FROM zones WHERE id::text = $1",
+            "SELECT owner FROM zones WHERE CAST(id AS varchar) = $1",
             &[&zone_id_str]
         ).await;
         
@@ -1624,7 +1641,7 @@ async fn push_config_to_agents(
         let ttl: i32 = body.ttl as i32;
     
         match (&*data.db).execute(
-            "INSERT INTO records (id, zone_id, name, type, value, ttl) VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO records (id, zone_id, name, type, value, ttl) VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, $6)",
             &[&id_str, &zone_id_str, &body.name, &body.record_type, &body.value, &ttl]
         ).await {
             Ok(_) => {
@@ -1650,19 +1667,19 @@ async fn push_config_to_agents(
         let zone_id_str = zone_id.into_inner();
         let rows = (&*data.db)
             .query(
-                "SELECT id::text, zone_id::text, name, type, value, ttl FROM records WHERE zone_id::text = $1 ORDER BY name",
+                "SELECT CAST(id AS varchar), CAST(zone_id AS varchar), name, type, value, ttl FROM records WHERE CAST(zone_id AS varchar) = $1 ORDER BY name",
                 &[&zone_id_str]
             )
             .await
             .unwrap_or_default();
     
         let records: Vec<RecordResponse> = rows.into_iter().map(|r| RecordResponse {
-            id: r.get(0),
-            zone_id: r.get(1),
-            name: r.get(2),
-            record_type: r.get(3),
-            value: r.get(4),
-            ttl: r.get::<_, i32>(5) as u32,
+            id: r.try_get(0).unwrap_or_default(),
+            zone_id: r.try_get(1).unwrap_or_default(),
+            name: r.try_get(2).unwrap_or_default(),
+            record_type: r.try_get(3).unwrap_or_default(),
+            value: r.try_get(4).unwrap_or_default(),
+            ttl: r.try_get::<_, i32>(5).unwrap_or(0) as u32,
         }).collect();
     
         HttpResponse::Ok().json(records)
@@ -1721,7 +1738,7 @@ async fn push_config_to_agents(
         }
     
         let query = format!(
-            "UPDATE records SET {} WHERE id::text = ${} AND zone_id::text = ${}",
+            "UPDATE records SET {} WHERE CAST(id AS varchar) = ${} AND CAST(zone_id AS varchar) = ${}",
             updates.join(", "), param_idx, param_idx + 1
         );
     
@@ -1759,13 +1776,13 @@ async fn push_config_to_agents(
     
         // Check zone ownership
         let owner_check = (&*data.db).query_opt(
-            "SELECT owner FROM zones WHERE id::text = $1",
+            "SELECT owner FROM zones WHERE CAST(id AS varchar) = $1",
             &[&zone_id]
         ).await;
         
         let tok = auth.unwrap();
         let zone_owner: Option<String> = match owner_check {
-            Ok(Some(row)) => row.get(0),
+            Ok(Some(row)) => row.try_get(0).ok(),
             _ => None
         };
         
@@ -1774,7 +1791,7 @@ async fn push_config_to_agents(
         }
     
         match (&*data.db).execute(
-            "DELETE FROM records WHERE id::text = $1 AND zone_id::text = $2",
+            "DELETE FROM records WHERE CAST(id AS varchar) = $1 AND CAST(zone_id AS varchar) = $2",
             &[&record_id, &zone_id]
         ).await {
             Ok(count) => {
@@ -1822,7 +1839,7 @@ async fn push_config_to_agents(
         }
         
         let rows = (&*data.db).query(
-            "SELECT id::text, COALESCE(user_id::text, '') as user_id, action, resource_type, 
+            "SELECT CAST(id AS varchar), COALESCE(CAST(user_id AS varchar), '') as user_id, action, resource_type, 
                     COALESCE(resource_id, '') as resource_id, 
                     COALESCE(details::text, '') as details,
                     COALESCE(ip_address, '') as ip_address,
@@ -1834,14 +1851,14 @@ async fn push_config_to_agents(
         ).await.unwrap_or_default();
         
         let logs: Vec<AuditLogEntry> = rows.into_iter().map(|r| AuditLogEntry {
-            id: r.get(0),
-            user_id: Some(r.get(1)).filter(|s: &String| !s.is_empty()),
-            action: r.get(2),
-            resource_type: r.get(3),
-            resource_id: Some(r.get(4)).filter(|s: &String| !s.is_empty()),
-            details: r.get(5),
-            ip_address: Some(r.get(6)).filter(|s: &String| !s.is_empty()),
-            created_at: r.get(7),
+            id: r.try_get(0).unwrap_or_default(),
+            user_id: Some(r.try_get(1).unwrap_or_default()).filter(|s: &String| !s.is_empty()),
+            action: r.try_get(2).unwrap_or_default(),
+            resource_type: r.try_get(3).unwrap_or_default(),
+            resource_id: Some(r.try_get(4).unwrap_or_default()).filter(|s: &String| !s.is_empty()),
+            details: r.try_get(5).unwrap_or_default(),
+            ip_address: Some(r.try_get(6).unwrap_or_default()).filter(|s: &String| !s.is_empty()),
+            created_at: r.try_get(7).unwrap_or_default(),
         }).collect();
         
         HttpResponse::Ok().json(ApiResponse { success: true, data: Some(logs), error: None })
@@ -1861,16 +1878,16 @@ async fn push_config_to_agents(
         let zone_id = path.into_inner();
         
         match (&*data.db).query_one(
-            "SELECT id::text, domain, COALESCE(owner::text, '') as owner, zone_type, created_at::text FROM zones WHERE id::text = $1",
+            "SELECT CAST(id AS varchar), domain, COALESCE(CAST(owner AS varchar), '') as owner, zone_type, created_at::text FROM zones WHERE CAST(id AS varchar) = $1",
             &[&zone_id]
         ).await {
             Ok(row) => {
                 let zone = ZoneWithOwner {
-                    id: row.get(0),
-                    domain: row.get(1),
-                    owner: row.get(2),
-                    zone_type: row.get(3),
-                    created_at: row.get(4),
+                    id: row.try_get(0).unwrap_or_default(),
+                    domain: row.try_get(1).unwrap_or_default(),
+                    owner: row.try_get(2).unwrap_or_default(),
+                    zone_type: row.try_get(3).unwrap_or_default(),
+                    created_at: row.try_get(4).unwrap_or_default(),
                 };
                 HttpResponse::Ok().json(ApiResponse { success: true, data: Some(zone), error: None })
             }
@@ -1892,17 +1909,17 @@ async fn push_config_to_agents(
         let zone_id = path.into_inner();
         
         let zone_row = match (&*data.db).query_opt(
-            "SELECT domain FROM zones WHERE id::text = $1",
+            "SELECT domain FROM zones WHERE CAST(id AS varchar) = $1",
             &[&zone_id]
         ).await {
             Ok(Some(row)) => row,
             _ => return HttpResponse::NotFound().json(ErrorResponse { error: "zone not found".to_string(), details: None })
         };
         
-        let domain: String = zone_row.get(0);
+        let domain: String = zone_row.try_get(0).unwrap_or_default();
         
         let records = (&*data.db).query(
-            "SELECT name, type, value, ttl FROM records WHERE zone_id::text = $1",
+            "SELECT name, type, value, ttl FROM records WHERE CAST(zone_id AS varchar) = $1",
             &[&zone_id]
         ).await.unwrap_or_default();
         
@@ -1910,10 +1927,10 @@ async fn push_config_to_agents(
         zone_content.push_str(&format!("@ 3600 IN SOA ns.{} hostmaster.{} 1 3600 3600 604800 3600\n\n", domain, domain));
         
         for r in records {
-            let name: String = r.get(0);
-            let typ: String = r.get(1);
-            let value: String = r.get(2);
-            let ttl: i32 = r.get(3);
+            let name: String = r.try_get(0).unwrap_or_default();
+            let typ: String = r.try_get(1).unwrap_or_default();
+            let value: String = r.try_get(2).unwrap_or_default();
+            let ttl: i32 = r.try_get(3).unwrap_or(0);
             zone_content.push_str(&format!("{} {} IN {} {}\n", if name.is_empty() || name == "@" { "@" } else { &name }, ttl, typ, value));
         }
         
@@ -1953,7 +1970,7 @@ async fn push_config_to_agents(
         for record in body.records.iter() {
             let ttl = record.ttl.unwrap_or(3600) as i32;
             match (&*data.db).execute(
-                "INSERT INTO records (id, zone_id, name, type, value, ttl) VALUES ($1, $2, $3, $4, $5, $6)",
+                "INSERT INTO records (id, zone_id, name, type, value, ttl) VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, $6)",
                 &[&Uuid::new_v4().to_string(), &zone_id, &record.name, &record.record_type, &record.value, &ttl]
             ).await {
                 Ok(_) => imported += 1,
@@ -1983,12 +2000,12 @@ async fn push_config_to_agents(
         
         // Check ownership
         let owner_check = (&*data.db).query_opt(
-            "SELECT owner FROM zones WHERE id::text = $1",
+            "SELECT owner FROM zones WHERE CAST(id AS varchar) = $1",
             &[&zone_id]
         ).await;
         
         let zone_owner: Option<String> = match owner_check {
-            Ok(Some(row)) => row.get(0),
+            Ok(Some(row)) => row.try_get(0).ok(),
             _ => None
         };
         
@@ -1996,7 +2013,7 @@ async fn push_config_to_agents(
             return HttpResponse::Forbidden().json(ErrorResponse { error: "access denied".to_string(), details: None });
         }
         
-        match (&*data.db).execute("DELETE FROM zones WHERE id::text = $1", &[&zone_id]).await {
+        match (&*data.db).execute("DELETE FROM zones WHERE CAST(id AS varchar) = $1", &[&zone_id]).await {
             Ok(count) => {
                 if count == 0 {
                     HttpResponse::NotFound().json(ErrorResponse { error: "zone not found".to_string(), details: None })
@@ -2042,7 +2059,7 @@ async fn main() -> std::io::Result<()> {
     let force_bootstrap = std::env::var("FORCE_BOOTSTRAP").unwrap_or_else(|_| "false".to_string()).to_lowercase() == "true";
     if let (Ok(admin_user), Ok(admin_password)) = (std::env::var("ADMIN_USERNAME"), std::env::var("ADMIN_PASSWORD")) {
         // check if a user exists with that username
-        if let Ok(rows) = (&client).query("SELECT id::text, password_hash FROM users WHERE username = $1 LIMIT 1", &[&admin_user]).await {
+        if let Ok(rows) = (&client).query("SELECT CAST(id AS varchar), password_hash FROM users WHERE username = $1 LIMIT 1", &[&admin_user]).await {
             if rows.is_empty() {
                 // create new admin
                 let mut rng = OsRng;
@@ -2052,13 +2069,13 @@ async fn main() -> std::io::Result<()> {
                 let id = Uuid::new_v4();
                 let id_str = id.to_string();
                 let role = "admin";
-                match (&client).execute("INSERT INTO users (id, username, password_hash, role) VALUES ($1, $2, $3, $4)", &[&id_str, &admin_user, &password_hash, &role]).await {
+                match (&client).execute("INSERT INTO users (id, username, password_hash, role) VALUES ($1::text::uuid, $2, $3, $4)", &[&id_str, &admin_user, &password_hash, &role]).await {
                     Ok(_) => info!("Bootstrapped admin user '{}'", admin_user),
                     Err(e) => warn!("Failed to create admin user '{}': {}", admin_user, e),
                 }
             } else {
                 // user exists, ensure password_hash looks valid (contains $argon2)
-                let existing_hash: String = rows[0].get(1);
+                let existing_hash: String = rows[0].try_get(1).unwrap_or_default();
                 if force_bootstrap {
                     // Force update password hash when explicitly requested
                     let mut rng = OsRng;
