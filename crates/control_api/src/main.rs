@@ -788,7 +788,7 @@ async fn list_servers(data: web::Data<AppState>, req: HttpRequest) -> impl Respo
     
     // Query servers
     match (&*data.db).query(
-        "SELECT CAST(id AS varchar), name, address, port, region, enabled, dnssec, enable_logging, max_cache_ttl, min_cache_ttl FROM servers ORDER BY name", 
+        "SELECT CAST(id AS varchar), name, address FROM servers ORDER BY name", 
         &[]
     ).await {
         Ok(rows) => {
@@ -796,13 +796,13 @@ async fn list_servers(data: web::Data<AppState>, req: HttpRequest) -> impl Respo
                 id: r.try_get(0).unwrap_or_default(),
                 name: r.try_get(1).unwrap_or_default(),
                 address: r.try_get(2).unwrap_or_default(),
-                port: r.try_get(3).unwrap_or_default(),
-                region: r.try_get(4).ok().flatten(),
-                enabled: r.try_get(5).unwrap_or_default(),
-                dnssec: r.try_get(6).unwrap_or_default(),
-                enable_logging: r.try_get(7).unwrap_or_default(),
-                max_cache_ttl: r.try_get(8).unwrap_or_default(),
-                min_cache_ttl: r.try_get(9).unwrap_or_default(),
+                port: 53,  // default value
+                region: None,
+                enabled: true,  // default value
+                dnssec: false,  // default value
+                enable_logging: true,  // default value
+                max_cache_ttl: 3600,  // default value
+                min_cache_ttl: 60,  // default value
                 status: None,
             }).collect();
             HttpResponse::Ok().json(servers)
@@ -874,8 +874,8 @@ async fn create_server(body: web::Json<CreateServerReq>, data: web::Data<AppStat
     let min_cache_ttl = body.min_cache_ttl.unwrap_or(60);
     
     match (&*data.db).execute(
-        "INSERT INTO servers (id, name, address, port, region, enabled, dnssec, enable_logging, max_cache_ttl, min_cache_ttl) VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10)", 
-        &[&id_str, &body.name, &body.address, &port, &body.region, &enabled, &dnssec, &enable_logging, &max_cache_ttl, &min_cache_ttl]
+        "INSERT INTO servers (id, name, address, region) VALUES ($1::text::uuid, $2, $3, $4)", 
+        &[&id_str, &body.name, &body.address, &body.region]
     ).await {
         Ok(_) => {
             info!("Created server: {} at {}", body.name, body.address);
