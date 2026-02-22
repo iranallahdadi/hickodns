@@ -641,13 +641,14 @@ async fn list_users(data: web::Data<AppState>, req: HttpRequest) -> impl Respond
     }
     
     match (&*data.db).query(
-        "SELECT id::TEXT, username, role, to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') as created_at_str FROM users ORDER BY username",
+        "SELECT id, username, role, to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') as created_at_str FROM users ORDER BY username",
         &[]
     ).await {
         Ok(rows) => {
             let users: Vec<_> = rows.into_iter().map(|r| {
+                let id: uuid::Uuid = r.get(0);
                 serde_json::json!({
-                    "id": r.get::<_, String>(0),
+                    "id": id.to_string(),
                     "username": r.get::<_, String>(1),
                     "role": r.get::<_, String>(2),
                     "createdAt": r.get::<_, Option<String>>(3).unwrap_or_else(|| String::from(""))
