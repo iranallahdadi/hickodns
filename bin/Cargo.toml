@@ -90,6 +90,7 @@ hickory-net.workspace = true
 hickory-resolver.workspace = true
 hickory-server = { workspace = true, features = ["toml"] }
 hostname.workspace = true
+notify = "6"
 metrics = { workspace = true, optional = true }
 metrics-exporter-prometheus = { workspace = true, optional = true }
 metrics-process = { workspace = true, optional = true }

@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use log::{info, warn};
 use std::sync::Arc;
+mod dns_manager;
+use dns_manager::DnsManager;
+mod zone_file_generator;
+use zone_file_generator::generate_all;
 use std::collections::HashMap;
 use std::process::Command;
 use tokio_postgres::NoTls;
@@ -144,6 +148,7 @@ struct FullState {
     inner: AppState,
     geo: Arc<tokio::sync::Mutex<GeoState>>,
     processes: Arc<tokio::sync::Mutex<HashMap<String, std::process::Child>>>,
+    dns_manager: Arc<DnsManager>,
 }
 
 async fn health() -> impl Responder {
@@ -1128,100 +1133,21 @@ async fn start_dns_server(body: web::Json<StartDnsReq>, data: web::Data<FullStat
         body.bind.split(':').last().unwrap_or("53").parse().unwrap_or(53)
     };
 
-    // create temp config dir
-    let config_dir = format!("/tmp/hickory_control/{}", server_id);
-    if let Err(e) = std::fs::create_dir_all(&config_dir) {
-        warn!("failed create config dir {}: {}", config_dir, e);
-        return HttpResponse::InternalServerError().body("failed to create config dir");
-    }
+    // Build bind socket addr
+    let bind_str = if body.bind.is_empty() { "0.0.0.0:53".to_string() } else { format!("{}:{}", bind_addr, port) };
+    let sock: std::net::SocketAddr = match bind_str.parse() {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::BadRequest().body(format!("invalid bind address: {}", e)),
+    };
 
-    // write zone files from DB
-    let zones = (&*data.inner.db).query("SELECT CAST(id AS varchar), domain FROM zones", &[]).await.unwrap_or_default();
-    let mut zone_configs = String::new();
-    
-    for z in zones.into_iter() {
-        let zid: String = z.try_get(0).unwrap_or_default();
-        let domain: String = z.try_get(1).unwrap_or_default();
-        let fname = format!("{}/{}.zone", config_dir, domain.replace('.', "_").replace("-", "_"));
-        if let Ok(mut f) = std::fs::File::create(&fname) {
-            use std::io::Write;
-            let soa = format!("@ 3600 IN SOA ns.{} hostmaster.{} 1 3600 3600 604800 3600\n", domain, domain);
-            let _ = f.write_all(soa.as_bytes());
-            let recs = (&*data.inner.db).query("SELECT name, type, value, ttl FROM records WHERE CAST(zone_id AS varchar) = $1", &[&zid]).await.unwrap_or_default();
-            for r in recs {
-                let name: String = r.get(0);
-                let typ: String = r.get(1);
-                let value: String = r.get(2);
-                let ttl: i32 = r.get(3);
-                let rr = format!("{} {} IN {} {}\n", if name.is_empty() || name == "@" { "@" } else { &name }, ttl, typ, value);
-                let _ = f.write_all(rr.as_bytes());
-            }
-        }
-        zone_configs.push_str(&format!(
-            r#"[[zones]]
-zone = "{}"
-zone_type = "Primary"
-file = "{}.zone"
-
-"#,
-            domain.trim_end_matches('.'),
-            domain.replace('.', "_").replace("-", "_")
-        ));
-    }
-
-    // Generate TOML config
-    let config_content = format!(
-        r#"# Auto-generated config for Hickory DNS
-listen_addrs_ipv4 = ["{}"]
-listen_port = {}
-
-{}
-
-[[zones]]
-zone = "localhost"
-zone_type = "Primary"
-file = "default/localhost.zone"
-
-[[zones]]
-zone = "0.0.127.in-addr.arpa"
-zone_type = "Primary"
-file = "default/127.0.0.1.zone"
-"#,
-        bind_addr,
-        port,
-        zone_configs
-    );
-
-    let config_path = format!("{}/named.toml", config_dir);
-    if let Err(e) = std::fs::write(&config_path, config_content) {
-        warn!("failed write config {}: {}", config_path, e);
-        return HttpResponse::InternalServerError().body("failed to write config");
-    }
-
-    // Copy default zone files if they exist
-    let default_zones = ["localhost.zone", "127.0.0.1.zone"];
-    for dz in default_zones.iter() {
-        let src = format!("/home/outis/work-github/OutisCloud-hickory-dns/tests/test-data/test_configs/default/{}", dz);
-        let dst = format!("{}/default/{}", config_dir, dz);
-        if std::path::Path::new(&src).exists() {
-            let _ = std::fs::create_dir_all(format!("{}/default", config_dir));
-            let _ = std::fs::copy(&src, &dst);
-        }
-    }
-
-    let bin = std::env::var("HICKORY_DNS_BIN").unwrap_or_else(|_| "./target/debug/hickory-dns".to_string());
-    let mut cmd = Command::new(bin);
-    cmd.arg("-d").arg(format!("-c={}", config_path));
-
-    match cmd.spawn() {
-        Ok(child) => {
-            let mut procs = data.processes.lock().await;
-            procs.insert(server_id.clone(), child);
-            HttpResponse::Ok().json(serde_json::json!({"status":"started","server_id": server_id, "bind": format!("{}:{}", bind_addr, port)}))
-        }
+    // Start in-process DNS server backed by DB
+    let dm = data.dns_manager.clone();
+    let db_client = data.inner.db.clone();
+    match dm.start_server(&server_id, sock, db_client).await {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status":"started","server_id": server_id, "bind": bind_str})),
         Err(e) => {
-            warn!("failed spawning dns process: {}", e);
-            HttpResponse::InternalServerError().body("failed to spawn dns")
+            warn!("failed starting dns server: {}", e);
+            HttpResponse::InternalServerError().body("failed to start dns server")
         }
     }
 }
@@ -1242,17 +1168,13 @@ async fn stop_dns_server(body: web::Json<StopDnsReq>, data: web::Data<FullState>
     }
 
     let server_id = body.id.clone();
-    let mut procs = data.processes.lock().await;
-    if let Some(mut child) = procs.remove(&server_id) {
-        match child.kill() {
-            Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status":"stopped","server_id": server_id})),
-            Err(e) => {
-                warn!("failed killing process {}: {}", server_id, e);
-                HttpResponse::InternalServerError().body("failed to stop process")
-            }
+    let dm = data.dns_manager.clone();
+    match dm.stop_server(&server_id).await {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status":"stopped","server_id": server_id})),
+        Err(e) => {
+            warn!("failed stopping dns server {}: {}", server_id, e);
+            HttpResponse::InternalServerError().body("failed to stop server")
         }
-    } else {
-        HttpResponse::NotFound().body("server not found or not running")
     }
 }
 
@@ -1296,21 +1218,42 @@ async fn dns_reload(body: web::Json<ReloadDnsReq>, data: web::Data<FullState>, r
     }
 
     let server_id = body.id.clone();
-    let mut procs = data.processes.lock().await;
-    
-    if let Some(child) = procs.get_mut(&server_id) {
-        match child.kill() {
-            Ok(_) => {
-                drop(procs);
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                let mut new_procs = data.processes.lock().await;
-                new_procs.remove(&server_id);
-                HttpResponse::Ok().json(serde_json::json!({"status": "reloaded", "server_id": server_id}))
-            }
-            Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("failed to reload: {}", e)}))
+    let dm = data.dns_manager.clone();
+    // stop then start again using default bind
+    if let Err(e) = dm.stop_server(&server_id).await {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("failed to stop server: {}", e)}));
+    }
+
+    // use env or default bind
+    let bind_env = std::env::var("HICKORY_DNS_BIND").unwrap_or_else(|_| "0.0.0.0:53".to_string());
+    let bind_addr: std::net::SocketAddr = match bind_env.parse() {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("invalid bind for reload: {}", e)})),
+    };
+
+    if let Err(e) = dm.start_server(&server_id, bind_addr, data.inner.db.clone()).await {
+        return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("failed to start server: {}", e)}));
+    }
+
+    HttpResponse::Ok().json(serde_json::json!({"status": "reloaded", "server_id": server_id}))
+}
+
+async fn generate_dns_files(data: web::Data<FullState>, req: HttpRequest) -> impl Responder {
+    if let Some(tok) = auth_from_header(&req, &data.inner.jwt_secret) {
+        if tok.claims.role != "admin" {
+            return HttpResponse::Forbidden().json(serde_json::json!({"error": "admin role required"}));
         }
     } else {
-        HttpResponse::NotFound().json(serde_json::json!({"error": "server not found"}))
+        return HttpResponse::Unauthorized().json(serde_json::json!({"error": "unauthorized"}));
+    }
+
+    let out_dir = std::env::var("HICKORY_DNS_DIR").unwrap_or_else(|_| "/etc/hickory".to_string());
+    match generate_all(&out_dir, data.inner.db.clone()).await {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "generated", "path": out_dir})),
+        Err(e) => {
+            warn!("failed to generate zone files: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("generation failed: {}", e)}))
+        }
     }
 }
 
@@ -1468,6 +1411,9 @@ async fn create_zone(body: web::Json<CreateZoneReq>, data: web::Data<AppState>, 
             ).await {
                 warn!("Failed to add default SOA record: {}", e);
             }
+            // regenerate zone files after creating a zone
+            let out_dir = std::env::var("HICKORY_DNS_DIR").unwrap_or_else(|_| "/etc/hickory".to_string());
+            let _ = zone_file_generator::generate_all(&out_dir, data.inner.db.clone()).await;
             
             HttpResponse::Created().json(serde_json::json!({"id": zone_id_str, "domain": &body.domain}))
         }
@@ -1679,6 +1625,9 @@ async fn push_config_to_agents(
         ).await {
             Ok(_) => {
                 info!("Created record: {} ({}) in zone: {}", body.name, body.record_type, zone_id_str);
+                // regenerate zone files after mutations
+                let out_dir = std::env::var("HICKORY_DNS_DIR").unwrap_or_else(|_| "/etc/hickory".to_string());
+                let _ = zone_file_generator::generate_all(&out_dir, data.inner.db.clone()).await;
                 HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "name": body.name, "type": body.record_type, "value": body.value}))
             }
             Err(e) => {
@@ -2227,7 +2176,24 @@ async fn main() -> std::io::Result<()> {
         std::fs::read(p).ok().and_then(|b| geodns::GeoDB::open_from_bytes(b).ok())
     });
 
-    let full_state = FullState { inner: app_state.clone(), geo: std::sync::Arc::new(tokio::sync::Mutex::new(GeoState { db: geo_db })), processes: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())) };
+    let dns_manager = Arc::new(DnsManager::new());
+    let full_state = FullState { inner: app_state.clone(), geo: std::sync::Arc::new(tokio::sync::Mutex::new(GeoState { db: geo_db })), processes: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())), dns_manager: dns_manager.clone() };
+
+    // Auto-start DNS server on startup using DB-backed handler. Bind address is configured
+    // via HICKORY_DNS_BIND (default 0.0.0.0:53). Errors are logged but don't stop control API.
+    let bind_env = std::env::var("HICKORY_DNS_BIND").unwrap_or_else(|_| "0.0.0.0:53".to_string());
+    if let Ok(bind_addr) = bind_env.parse::<std::net::SocketAddr>() {
+        let db_client = app_state.db.clone();
+        tokio::spawn(async move {
+            if let Err(e) = dns_manager.start_server("default", bind_addr, db_client).await {
+                tracing::warn!("failed to start default dns server: {}", e);
+            } else {
+                tracing::info!("default dns server started on {}", bind_addr);
+            }
+        });
+    } else {
+        tracing::warn!("invalid HICKORY_DNS_BIND '{}', skipping auto-start", bind_env);
+    }
 
     // Prometheus metrics middleware
     let prometheus = PrometheusMetricsBuilder::new("control_api").endpoint("/metrics").build().expect("prometheus builder");
@@ -2285,6 +2251,7 @@ async fn main() -> std::io::Result<()> {
             .route("/api/v1/dns/stop", web::post().to(stop_dns_server))
             .route("/api/v1/dns/status", web::get().to(dns_status))
             .route("/api/v1/dns/reload", web::post().to(dns_reload))
+            .route("/api/v1/dns/generate", web::post().to(generate_dns_files))
             // GeoRules
             .route("/api/v1/georules", web::post().to(create_georule))
             .route("/api/v1/georules", web::get().to(list_georules))

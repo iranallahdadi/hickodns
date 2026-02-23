@@ -32,6 +32,10 @@ use hickory_server::{server::Server, zone_handler::Catalog};
 
 mod config;
 use config::Config;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc as SyncArc;
+use notify::{Watcher, RecommendedWatcher, RecursiveMode, Config as NotifyConfig};
+use std::time::Duration as StdDuration;
 
 #[cfg(feature = "__dnssec")]
 pub mod dnssec;
@@ -294,6 +298,9 @@ impl DnsServer {
         let mut signal = signal(SignalKind::terminate())
             .map_err(|e| format!("failed to register signal handler: {e}"))?;
 
+        // exit flag to distinguish SIGTERM (exit) from file-change reloads
+        let exit_flag = SyncArc::new(AtomicBool::new(false));
+
         let mut catalog = Catalog::new();
         catalog.set_nsid(nsid);
 
@@ -416,11 +423,51 @@ impl DnsServer {
         #[cfg(unix)]
         {
             let token = server.shutdown_token().clone();
+            let exit_flag_clone = exit_flag.clone();
             tokio::spawn(async move {
                 signal.recv().await;
+                // mark that this is an exit request, not just a reload
+                exit_flag_clone.store(true, Ordering::SeqCst);
                 token.cancel();
             });
         }
+
+        // Watch for config / zone file changes and cancel the server to trigger a reload
+        // Use a thread-based watcher so we can call CancellationToken::cancel() from it
+        let token_for_watcher = server.shutdown_token().clone();
+        let cfg_watch_path = config_path.to_path_buf();
+        let zone_watch_dir = zone_dir.clone();
+        std::thread::spawn(move || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut watcher: RecommendedWatcher = match RecommendedWatcher::new(tx, NotifyConfig::default()) {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::error!("failed to create file watcher: {}", e);
+                    return;
+                }
+            };
+
+            // watch config file and zone directory
+            let _ = watcher.watch(&cfg_watch_path, RecursiveMode::NonRecursive);
+            let _ = watcher.watch(&zone_watch_dir, RecursiveMode::Recursive);
+
+            // debounce: collect events for a short window before triggering
+            loop {
+                match rx.recv() {
+                    Ok(_evt) => {
+                        // simple debounce sleep
+                        std::thread::sleep(StdDuration::from_millis(250));
+                        // drain remaining events
+                        while rx.try_recv().is_ok() {}
+                        tracing::info!("file change detected, triggering reload");
+                        token_for_watcher.cancel();
+                        // watcher thread ends; run loop in main will restart server
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
 
         // config complete, starting!
         banner();
