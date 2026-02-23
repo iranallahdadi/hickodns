@@ -1439,12 +1439,36 @@ async fn create_zone(body: web::Json<CreateZoneReq>, data: web::Data<AppState>, 
         }
     };
     
+    // Create zone
     match (&*data.db).execute(
         "INSERT INTO zones (id, domain, owner) VALUES ($1::text::uuid, $2, $3::text::uuid)",
         &[&zone_id_str, &domain, &owner_uuid_str]
     ).await {
         Ok(_) => {
             info!("Created zone: {} for owner: {}", domain, owner_uuid_str);
+            
+            // Add default NS records (primary and secondary nameservers)
+            let ns_values = vec!["ns1.my-dns.com.", "ns2.my-dns.com."];
+            for ns_value in ns_values {
+                let ns_id = Uuid::new_v4().to_string();
+                if let Err(e) = (&*data.db).execute(
+                    "INSERT INTO records (id, zone_id, name, type, value, ttl) VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, $6)",
+                    &[&ns_id, &zone_id_str, &"@", &"NS", &ns_value, &3600]
+                ).await {
+                    warn!("Failed to add default NS record: {}", e);
+                }
+            }
+            
+            // Add default SOA record
+            let soa_id = Uuid::new_v4().to_string();
+            let soa_value = format!("ns1.my-dns.com. hostmaster.{} 1 3600 3600 604800 3600", domain.trim_end_matches('.'));
+            if let Err(e) = (&*data.db).execute(
+                "INSERT INTO records (id, zone_id, name, type, value, ttl) VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, $6)",
+                &[&soa_id, &zone_id_str, &"@", &"SOA", &soa_value, &3600]
+            ).await {
+                warn!("Failed to add default SOA record: {}", e);
+            }
+            
             HttpResponse::Created().json(serde_json::json!({"id": zone_id_str, "domain": &body.domain}))
         }
         Err(e) => {
@@ -1609,14 +1633,17 @@ async fn push_config_to_agents(
         let tok = auth.unwrap();
         
         // Validate inputs
-        if body.name.is_empty() {
-            return HttpResponse::BadRequest().json(serde_json::json!({"error": "record name is required"}));
+        if body.name.is_empty() && body.name != "@" {
+            return HttpResponse::BadRequest().json(serde_json::json!({"error": "record name is required (use '@' for root)"}));
         }
         if let Err(e) = validate_record_type(&body.record_type) {
             return HttpResponse::BadRequest().json(serde_json::json!({"error": e}));
         }
         if body.value.is_empty() {
             return HttpResponse::BadRequest().json(serde_json::json!({"error": "record value is required"}));
+        }
+        if body.ttl == 0 {
+            return HttpResponse::BadRequest().json(serde_json::json!({"error": "TTL must be greater than 0"}));
         }
         
         // Check zone ownership
@@ -1628,7 +1655,13 @@ async fn push_config_to_agents(
         
         let zone_owner: Option<String> = match owner_check {
             Ok(Some(row)) => row.get(0),
-            _ => None
+            Ok(None) => {
+                return HttpResponse::NotFound().json(serde_json::json!({"error": "zone not found"}));
+            }
+            Err(e) => {
+                warn!("zone ownership check error: {}", e);
+                return HttpResponse::InternalServerError().json(serde_json::json!({"error": "database error"}));
+            }
         };
         
         // Allow if user is admin or zone owner
@@ -1645,12 +1678,16 @@ async fn push_config_to_agents(
             &[&id_str, &zone_id_str, &body.name, &body.record_type, &body.value, &ttl]
         ).await {
             Ok(_) => {
-                info!("Created record: {} in zone: {}", body.name, zone_id_str);
-                HttpResponse::Created().json(serde_json::json!({"id": id.to_string()}))
+                info!("Created record: {} ({}) in zone: {}", body.name, body.record_type, zone_id_str);
+                HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "name": body.name, "type": body.record_type, "value": body.value}))
             }
             Err(e) => {
                 warn!("create_record error: {}", e);
-                HttpResponse::InternalServerError().json(serde_json::json!({"error": "failed to create record"}))
+                if e.to_string().contains("unique") {
+                    HttpResponse::Conflict().json(serde_json::json!({"error": "record already exists"}))
+                } else {
+                    HttpResponse::InternalServerError().json(serde_json::json!({"error": "failed to create record"}))
+                }
             }
         }
     }
@@ -1893,6 +1930,85 @@ async fn push_config_to_agents(
             }
             Err(_) => HttpResponse::NotFound().json(ErrorResponse { error: "zone not found".to_string(), details: None })
         }
+    }
+
+    #[derive(Deserialize)]
+    struct UpdateZoneReq {
+        domain: Option<String>,
+        zone_type: Option<String>,
+    }
+
+    async fn update_zone(
+        path: web::Path<String>,
+        body: web::Json<UpdateZoneReq>,
+        data: web::Data<AppState>,
+        req: HttpRequest,
+    ) -> impl Responder {
+        let auth = auth_from_header(&req, &data.jwt_secret);
+        if auth.is_none() {
+            return HttpResponse::Unauthorized().json(ErrorResponse { error: "unauthorized".to_string(), details: None });
+        }
+        let tok = auth.unwrap();
+        
+        let zone_id = path.into_inner();
+        
+        // Check zone ownership
+        let owner_check = (&*data.db).query_opt(
+            "SELECT owner FROM zones WHERE CAST(id AS varchar) = $1",
+            &[&zone_id]
+        ).await;
+        
+        let zone_owner: Option<String> = match owner_check {
+            Ok(Some(row)) => row.try_get(0).ok(),
+            _ => None
+        };
+        
+        if tok.claims.role != "admin" && zone_owner.as_ref() != Some(&tok.claims.sub) {
+            return HttpResponse::Forbidden().json(ErrorResponse { error: "access denied".to_string(), details: None });
+        }
+        
+        // Build update query
+        if let Some(new_domain) = &body.domain {
+            if let Err(e) = validate_domain(new_domain) {
+                return HttpResponse::BadRequest().json(serde_json::json!({"error": e}));
+            }
+            match (&*data.db).execute(
+                "UPDATE zones SET domain = $1, updated_at = now() WHERE CAST(id AS varchar) = $2",
+                &[new_domain, &zone_id]
+            ).await {
+                Ok(count) => {
+                    if count == 0 {
+                        return HttpResponse::NotFound().json(ErrorResponse { error: "zone not found".to_string(), details: None });
+                    }
+                }
+                Err(e) => {
+                    if e.to_string().contains("unique") {
+                        return HttpResponse::Conflict().json(serde_json::json!({"error": "domain already exists"}));
+                    }
+                    warn!("update_zone error: {}", e);
+                    return HttpResponse::InternalServerError().json(ErrorResponse { error: "failed to update zone".to_string(), details: None });
+                }
+            }
+        }
+        
+        if let Some(zone_type) = &body.zone_type {
+            match (&*data.db).execute(
+                "UPDATE zones SET zone_type = $1, updated_at = now() WHERE CAST(id AS varchar) = $2",
+                &[zone_type, &zone_id]
+            ).await {
+                Ok(count) => {
+                    if count == 0 {
+                        return HttpResponse::NotFound().json(ErrorResponse { error: "zone not found".to_string(), details: None });
+                    }
+                }
+                Err(e) => {
+                    warn!("update_zone error: {}", e);
+                    return HttpResponse::InternalServerError().json(ErrorResponse { error: "failed to update zone".to_string(), details: None });
+                }
+            }
+        }
+        
+        HttpResponse::Ok().json(ApiResponse { success: true, data: Some(serde_json::json!({"zone_id": zone_id})), error: None })
     }
 
     // Export zone
@@ -2149,6 +2265,7 @@ async fn main() -> std::io::Result<()> {
             .route("/api/v1/zones", web::get().to(list_zones))
             .route("/api/v1/zones", web::post().to(create_zone))
             .route("/api/v1/zones/{id}", web::get().to(get_zone))
+            .route("/api/v1/zones/{id}", web::put().to(update_zone))
             .route("/api/v1/zones/{id}", web::delete().to(delete_zone))
             .route("/api/v1/zones/{id}/export", web::get().to(export_zone))
             .route("/api/v1/zones/{id}/import", web::post().to(import_zone))

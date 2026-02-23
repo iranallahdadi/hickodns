@@ -78,7 +78,7 @@ export default function Records(){
               <FileText className="w-6 h-6 text-orange-600" />
             </div>
             <div>
-              <h3 className="text-xl font-bold text-gray-800">DNS FileTexts</h3>
+              <h3 className="text-xl font-bold text-gray-800">DNS Records</h3>
               <p className="text-sm text-gray-500">Zone: {zoneId?.substring(0,8)}...</p>
             </div>
           </div>
@@ -135,7 +135,7 @@ export default function Records(){
               onClick={create}
             >
               <Plus className="w-5 h-5" />
-              <span>Add FileText</span>
+              <span>Add Record</span>
             </button>
           </div>
         </div>
