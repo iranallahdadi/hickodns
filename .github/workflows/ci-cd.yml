@@ -166,7 +166,7 @@ jobs:
         run: helm package ./helm/hickory-dns --app-version ${{ github.ref_name }} --version 0.1.0
 
       - name: Upload Helm chart
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: helm-chart
           path: "*.tgz"
