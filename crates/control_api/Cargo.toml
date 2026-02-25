@@ -30,7 +30,7 @@ utoipa = "2"
 utoipa-actix-web = "0.1"
 
 # Rate limiting
-governor = "0.6"
+governor = "0.10"
 nonzero_ext = "0.3"
 regex = { version = "1", default-features = false }
 
