@@ -32,6 +32,7 @@ utoipa-actix-web = "0.1"
 # Rate limiting
 governor = "0.6"
 nonzero_ext = "0.3"
+regex = { version = "1", default-features = false }
 
 # Async traits
 async-trait = "0.1"
@@ -45,6 +46,7 @@ hickory-resolver = { path = "../resolver", optional = true }
 geodns = { path = "../geodns" }
 
 [dev-dependencies]
+tempfile = "3"
 tokio-test = "0.4"
 
 [profile.release]

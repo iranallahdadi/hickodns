@@ -100,11 +100,9 @@ export const serversApi = {
 };
 
 // ==================== DNS Control API ====================
+// only generation endpoint remains; the DNS server is managed separately
 export const dnsApi = {
-  start: (config) => api.post('/api/v1/dns/start', config),
-  stop: (serverId) => api.post('/api/v1/dns/stop', { id: serverId }),
-  reload: (serverId) => api.post('/api/v1/dns/reload', { id: serverId }),
-  status: () => api.get('/api/v1/dns/status'),
+  generate: () => api.post('/api/v1/dns/generate'),
 };
 
 // ==================== Agents API ====================

@@ -13,7 +13,7 @@ export default function Servers(){
     enabled: true, dnssec: false, enable_logging: true,
     max_cache_ttl: 3600, min_cache_ttl: 60
   })
-  const [starting, setStarting] = React.useState({})
+  // DNS control is handled externally; only configuration is managed here
 
   const load = async () => {
     setLoading(true)
@@ -76,23 +76,6 @@ export default function Servers(){
     } catch (e) { alert('Error deleting server') }
   }
 
-  const startDns = async (server) => {
-    setStarting(s => ({ ...s, [server.id]: true }))
-    try {
-      await api.post('/api/v1/dns/start', { id: server.id, bind: `${server.address}:${server.port || 53}` })
-      load()
-    } catch (e) { console.error(e) }
-    setStarting(s => ({ ...s, [server.id]: false }))
-  }
-
-  const stopDns = async (server) => {
-    setStarting(s => ({ ...s, [server.id]: true }))
-    try {
-      await api.post('/api/v1/dns/stop', { id: server.id })
-      load()
-    } catch (e) { console.error(e) }
-    setStarting(s => ({ ...s, [server.id]: false }))
-  }
 
   const getStatus = (server) => {
     return server.status === 'running' ? 'running' : 'stopped'
@@ -198,25 +181,8 @@ export default function Servers(){
                 </div>
 
                 <div className="flex items-center space-x-2 pt-4 border-t border-gray-100">
-                  {getStatus(server) === 'running' ? (
-                    <button 
-                      onClick={() => stopDns(server)}
-                      disabled={starting[server.id]}
-                      className="flex-1 flex items-center justify-center space-x-2 px-4 py-2 bg-red-50 text-red-600 rounded-lg hover:bg-red-100 transition-colors disabled:opacity-50"
-                    >
-                      <Square className="w-4 h-4" />
-                      <span>Stop</span>
-                    </button>
-                  ) : (
-                    <button 
-                      onClick={() => startDns(server)}
-                      disabled={starting[server.id]}
-                      className="flex-1 flex items-center justify-center space-x-2 px-4 py-2 bg-green-50 text-green-600 rounded-lg hover:bg-green-100 transition-colors disabled:opacity-50"
-                    >
-                      {starting[server.id] ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
-                      <span>Start</span>
-                    </button>
-                  )}
+                  {/* DNS control is managed outside of this API in Option B architecture. */}
+                  <span className="text-sm text-gray-500">DNS process is external; edit zone configuration only.</span>
                   <button 
                     onClick={() => openEdit(server)}
                     className="flex items-center justify-center space-x-2 px-4 py-2 bg-gray-50 text-gray-600 rounded-lg hover:bg-gray-100 transition-colors"

@@ -1,6 +1,7 @@
 import React from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import api from '../api/client'
+import { validators } from '../hooks/useFormValidation'
 import BulkImport from '../components/BulkImport'
 import Notifications from '../components/Notifications'
 import { useParams } from 'react-router-dom'
@@ -14,6 +15,8 @@ export default function Records(){
   const [type, setType] = React.useState('A')
   const [value, setValue] = React.useState('')
   const [ttl, setTtl] = React.useState(3600)
+  const [priority, setPriority] = React.useState(0)
+  const [editing, setEditing] = React.useState(null) // record being edited
   const [error, setError] = React.useState('')
   const [loading, setLoading] = React.useState(false)
   const notify = React.useContext(Notifications)
@@ -32,28 +35,62 @@ export default function Records(){
     load() 
   }, [zoneId])
 
+  const resetForm = () => {
+    setName(''); setType('A'); setValue(''); setTtl(3600); setPriority(0); setEditing(null); setError('');
+  }
+
+  const validateRecord = () => {
+    if (!type) { setError('Type is required'); return false }
+    if (!value) { setError('Value is required'); return false }
+    if (ttl <= 0) { setError('TTL must be positive'); return false }
+    // type-specific checks
+    switch(type) {
+      case 'A':
+        if (validators.ipAddress(value)) break
+        setError('Invalid IPv4 address'); return false
+      case 'AAAA':
+        if (validators.ipAddress(value)) break
+        setError('Invalid IPv6 address'); return false
+      case 'CNAME': case 'NS': case 'MX': case 'SRV':
+        if (!value.endsWith('.')) { setError('Target must be a fully qualified domain name ending with a dot'); return false }
+        break
+      default:
+        break
+    }
+    if ((type === 'MX' || type === 'SRV') && priority < 0) { setError('Priority must be non‑negative'); return false }
+    return true
+  }
+
   const create = async () => {
     setError('')
-    if (!type || !value) { setError('Type and value are required'); return }
-    try { 
-      await api.post(`/api/v1/zones/${zoneId}/records`, { name, record_type: type, value, ttl }); 
-      setName(''); setValue(''); setTtl(3600); 
-      load(); 
-      notify && notify.push('Record created successfully') 
-    } catch (e) { setError('create failed') } 
+    if (!validateRecord()) return
+    try {
+      const payload = { name, record_type: type, value, ttl, priority: (type === 'MX' || type === 'SRV' ? priority : undefined) }
+      if (editing) {
+        await api.put(`/api/v1/zones/${zoneId}/records/${editing.id}`, payload)
+        notify && notify.push('Record updated successfully')
+      } else {
+        await api.post(`/api/v1/zones/${zoneId}/records`, payload)
+        notify && notify.push('Record created successfully')
+      }
+      resetForm()
+      load();
+    } catch (e) { setError(editing ? 'update failed' : 'create failed') }
   }
   
   const remove = async (rid) => { 
     try { 
       await api.delete(`/api/v1/zones/${zoneId}/records/${rid}`); 
+      if (editing && editing.id === rid) resetForm()
       load() 
+      notify && notify.push('Record deleted')
     } catch (e) { alert('delete failed') } 
   }
   
   const onBulkComplete = ()=> load()
 
   const downloadTemplate = () => {
-    const sample = 'name,record_type,value,ttl\nwww,A,192.0.2.1,3600\nmail,A,192.0.2.2,3600\n@,MX,mail.example.com.,3600\n'
+    const sample = 'name,record_type,value,ttl,priority\nwww,A,192.0.2.1,3600,\nmail,A,192.0.2.2,3600,\n@,MX,mail.example.com.,3600,10\n'
     const blob = new Blob([sample], { type: 'text/csv' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -90,7 +127,7 @@ export default function Records(){
           </button>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-6 gap-4">
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Name</label>
             <input 
@@ -129,14 +166,27 @@ export default function Records(){
               onChange={e=>setTtl(Number(e.target.value))} 
             />
           </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Priority</label>
+            <input
+              type="number"
+              className="w-full border border-gray-300 rounded-lg px-4 py-2 focus:ring-2 focus:ring-orange-500 focus:border-transparent"
+              value={priority}
+              onChange={e => setPriority(Number(e.target.value))}
+            />
+            <p className="text-xs text-gray-500 mt-1">Only used for MX/SRV</p>
+          </div>
           <div className="flex items-end">
             <button 
               className="w-full bg-gradient-to-r from-orange-500 to-orange-600 text-white px-4 py-2 rounded-lg hover:from-orange-600 hover:to-orange-700 transition-all flex items-center justify-center space-x-2 font-medium"
               onClick={create}
             >
               <Plus className="w-5 h-5" />
-              <span>Add Record</span>
+              <span>{editing ? 'Save' : 'Add'} Record</span>
             </button>
+            {editing && (
+              <button onClick={resetForm} className="ml-2 text-gray-600 hover:text-gray-800">Cancel</button>
+            )}
           </div>
         </div>
 
@@ -183,6 +233,7 @@ export default function Records(){
                   <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Type</th>
                   <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Value</th>
                   <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">TTL</th>
+                  <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Priority</th>
                   <th className="px-6 py-3 text-right text-xs font-semibold text-gray-600 uppercase tracking-wider">Actions</th>
                 </tr>
               </thead>
@@ -210,7 +261,21 @@ export default function Records(){
                     </td>
                     <td className="px-6 py-4 text-sm text-gray-600 font-mono max-w-xs truncate">{r.value}</td>
                     <td className="px-6 py-4 text-sm text-gray-500">{r.ttl}</td>
-                    <td className="px-6 py-4 text-right">
+                    <td className="px-6 py-4 text-sm text-gray-500">{r.priority || ''}</td>
+                    <td className="px-6 py-4 text-right space-x-1">
+                      <button 
+                        onClick={()=>{
+                          setEditing(r);
+                          setName(r.name);
+                          setType(r.record_type);
+                          setValue(r.value);
+                          setTtl(r.ttl);
+                          setPriority(r.priority);
+                        }}
+                        className="text-blue-600 hover:text-blue-800 p-1 rounded hover:bg-blue-50"
+                      >
+                        Edit
+                      </button>
                       <button 
                         onClick={()=>remove(r.id)}
                         className="text-red-600 hover:text-red-800 p-1 rounded hover:bg-red-50"

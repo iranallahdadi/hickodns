@@ -174,17 +174,15 @@ export default function Dashboard() {
   const [servers, setServers] = useState([]);
   const [agents, setAgents] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [dnsRunning, setDnsRunning] = useState(false);
-  const [dnsLoading, setDnsLoading] = useState(false);
+  // DNS server lifecycle is managed externally; dashboard does not track it
 
   const loadData = async () => {
     setLoading(true);
     try {
-      const [zonesRes, serversRes, agentsRes, dnsStatusRes] = await Promise.all([
+      const [zonesRes, serversRes, agentsRes] = await Promise.all([
         api.get('/api/v1/zones').catch(() => ({ data: [] })),
         api.get('/api/v1/servers').catch(() => ({ data: [] })),
         api.get('/api/v1/agents').catch(() => ({ data: [] })),
-        api.get('/api/v1/dns/status').catch(() => ({ data: { servers: [] } }))
       ]);
       
       let recordCount = 0;
@@ -207,7 +205,6 @@ export default function Dashboard() {
       
       setServers(serversRes.data || []);
       setAgents(agentsRes.data || []);
-      setDnsRunning(dnsStatusRes.data?.servers?.length > 0);
     } catch (e) {
       console.warn('Failed to load dashboard data:', e);
     }
@@ -225,27 +222,6 @@ export default function Dashboard() {
     return () => clearInterval(interval);
   }, []);
 
-  const handleStartDns = async () => {
-    setDnsLoading(true);
-    try {
-      await api.post('/api/v1/dns/start', { bind: '0.0.0.0:53' });
-      setDnsRunning(true);
-    } catch (e) {
-      console.error('Failed to start DNS:', e);
-    }
-    setDnsLoading(false);
-  };
-
-  const handleStopDns = async () => {
-    setDnsLoading(true);
-    try {
-      await api.post('/api/v1/dns/stop', { id: 'main' });
-      setDnsRunning(false);
-    } catch (e) {
-      console.error('Failed to stop DNS:', e);
-    }
-    setDnsLoading(false);
-  };
 
   return (
     <div className="space-y-6">
@@ -268,23 +244,7 @@ export default function Dashboard() {
             <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
             Refresh
           </button>
-          <button 
-            onClick={dnsRunning ? handleStopDns : handleStartDns}
-            disabled={dnsLoading}
-            className={`flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-medium text-white transition-all ${
-              dnsRunning 
-                ? 'bg-danger-500 hover:bg-danger-600' 
-                : 'bg-success-500 hover:bg-success-600'
-            } disabled:opacity-50`}
-          >
-            {dnsLoading ? (
-              <RefreshCw className="w-4 h-4 animate-spin" />
-            ) : dnsRunning ? (
-              <><Square className="w-4 h-4" /> Stop DNS</>
-            ) : (
-              <><Play className="w-4 h-4" /> Start DNS</>
-            )}
-          </button>
+          {/* DNS is managed separately; no controls shown here. */}
         </div>
       </motion.div>
 
@@ -466,7 +426,7 @@ export default function Dashboard() {
           {[
             { name: 'API Server', status: 'healthy', icon: Server },
             { name: 'Database', status: 'healthy', icon: Database },
-            { name: 'DNS Service', status: dnsRunning ? 'running' : 'stopped', icon: Network },
+            // DNS service is external to the control API; do not report a status
             { name: 'GeoDNS', status: 'ready', icon: Globe },
           ].map((item) => (
             <div key={item.name} className="flex items-center gap-3 p-3 rounded-xl bg-gray-50 dark:bg-gray-700/50">

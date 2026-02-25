@@ -3,8 +3,6 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use log::{info, warn};
 use std::sync::Arc;
-mod dns_manager;
-use dns_manager::DnsManager;
 mod zone_file_generator;
 use zone_file_generator::generate_all;
 use std::collections::HashMap;
@@ -20,6 +18,7 @@ use actix_web_prom::PrometheusMetricsBuilder;
 use prometheus::{TextEncoder, Encoder};
 use prometheus::gather;
 use chrono::TimeZone;
+use regex::Regex;
 
 /// Build a CORS middleware instance based on the `ALLOWED_ORIGINS`
 /// environment variable.  The value may be a comma-separated list of
@@ -148,7 +147,6 @@ struct FullState {
     inner: AppState,
     geo: Arc<tokio::sync::Mutex<GeoState>>,
     processes: Arc<tokio::sync::Mutex<HashMap<String, std::process::Child>>>,
-    dns_manager: Arc<DnsManager>,
 }
 
 async fn health() -> impl Responder {
@@ -183,6 +181,38 @@ fn validate_record_type(record_type: &str) -> Result<(), String> {
     let valid_types = ["A", "AAAA", "CNAME", "MX", "TXT", "NS", "SOA", "SRV", "CAA", "DS", "DNSKEY"];
     if !valid_types.contains(&record_type.to_uppercase().as_str()) {
         return Err(format!("Invalid record type: {}", record_type));
+    }
+    Ok(())
+}
+
+fn validate_record_value(record_type: &str, value: &str) -> Result<(), String> {
+    let v = value.trim();
+    match record_type.to_uppercase().as_str() {
+        "A" => {
+            let ipv4 = regex::Regex::new(r"^(?:\d{1,3}\.){3}\d{1,3}$").unwrap();
+            if !ipv4.is_match(v) {
+                return Err("invalid IPv4 address".to_string());
+            }
+        }
+        "AAAA" => {
+            let ipv6 = regex::Regex::new(r"^[0-9a-fA-F:]+$").unwrap();
+            if !ipv6.is_match(v) {
+                return Err("invalid IPv6 address".to_string());
+            }
+        }
+        "CNAME" | "NS" | "MX" | "SRV" => {
+            // must be a domain name ending with dot
+            if !v.ends_with('.') {
+                return Err("target must be a fully qualified domain name ending with a dot".to_string());
+            }
+        }
+        "MX" | "SRV" => {
+            // priority may be in value for MX; for SRV value should be "weight port target"
+            if v.is_empty() {
+                return Err("value required".to_string());
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -1152,93 +1182,13 @@ async fn start_dns_server(body: web::Json<StartDnsReq>, data: web::Data<FullStat
     }
 }
 
-#[derive(Deserialize)]
-#[allow(dead_code)]
-struct StopDnsReq {
-    id: String,
-}
-async fn stop_dns_server(body: web::Json<StopDnsReq>, data: web::Data<FullState>, req: HttpRequest) -> impl Responder {
-    // require admin via JWT
-    if let Some(tok) = auth_from_header(&req, &data.inner.jwt_secret) {
-        if tok.claims.role != "admin" {
-            return HttpResponse::Forbidden().body("admin role required");
-        }
-    } else {
-        return HttpResponse::Unauthorized().finish();
-    }
 
-    let server_id = body.id.clone();
-    let dm = data.dns_manager.clone();
-    match dm.stop_server(&server_id).await {
-        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status":"stopped","server_id": server_id})),
-        Err(e) => {
-            warn!("failed stopping dns server {}: {}", server_id, e);
-            HttpResponse::InternalServerError().body("failed to stop server")
-        }
-    }
-}
 
-async fn dns_status(data: web::Data<FullState>, req: HttpRequest) -> impl Responder {
-    if let Some(tok) = auth_from_header(&req, &data.inner.jwt_secret) {
-        if tok.claims.role != "admin" {
-            return HttpResponse::Forbidden().json(serde_json::json!({"error": "admin role required"}));
-        }
-    } else {
-        return HttpResponse::Unauthorized().json(serde_json::json!({"error": "unauthorized"}));
-    }
 
-    let procs = data.processes.lock().await;
-    let mut servers: Vec<serde_json::Value> = Vec::new();
-    
-    for (id, _) in procs.iter() {
-        servers.push(serde_json::json!({
-            "id": id,
-            "status": "running"
-        }));
-    }
-    
-    HttpResponse::Ok().json(serde_json::json!({
-        "servers": servers,
-        "total": servers.len()
-    }))
-}
-
-#[derive(Deserialize)]
-struct ReloadDnsReq {
-    id: String,
-}
-
-async fn dns_reload(body: web::Json<ReloadDnsReq>, data: web::Data<FullState>, req: HttpRequest) -> impl Responder {
-    if let Some(tok) = auth_from_header(&req, &data.inner.jwt_secret) {
-        if tok.claims.role != "admin" {
-            return HttpResponse::Forbidden().json(serde_json::json!({"error": "admin role required"}));
-        }
-    } else {
-        return HttpResponse::Unauthorized().json(serde_json::json!({"error": "unauthorized"}));
-    }
-
-    let server_id = body.id.clone();
-    let dm = data.dns_manager.clone();
-    // stop then start again using default bind
-    if let Err(e) = dm.stop_server(&server_id).await {
-        return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("failed to stop server: {}", e)}));
-    }
-
-    // use env or default bind
-    let bind_env = std::env::var("HICKORY_DNS_BIND").unwrap_or_else(|_| "0.0.0.0:53".to_string());
-    let bind_addr: std::net::SocketAddr = match bind_env.parse() {
-        Ok(s) => s,
-        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("invalid bind for reload: {}", e)})),
-    };
-
-    if let Err(e) = dm.start_server(&server_id, bind_addr, data.inner.db.clone()).await {
-        return HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("failed to start server: {}", e)}));
-    }
-
-    HttpResponse::Ok().json(serde_json::json!({"status": "reloaded", "server_id": server_id}))
-}
 
 async fn generate_dns_files(data: web::Data<FullState>, req: HttpRequest) -> impl Responder {
+    // this endpoint is retained for debugging but is not required by the
+    // production architecture; generation is automatic on every write.
     if let Some(tok) = auth_from_header(&req, &data.inner.jwt_secret) {
         if tok.claims.role != "admin" {
             return HttpResponse::Forbidden().json(serde_json::json!({"error": "admin role required"}));
@@ -1390,21 +1340,43 @@ async fn create_zone(body: web::Json<CreateZoneReq>, data: web::Data<AppState>, 
         Ok(_) => {
             info!("Created zone: {} for owner: {}", domain, owner_uuid_str);
             
-            // Add default NS records (primary and secondary nameservers)
-            let ns_values = vec!["ns1.my-dns.com.", "ns2.my-dns.com."];
-            for ns_value in ns_values {
+// Determine which public nameservers should be used for new zones.  This
+            // list can be overridden by setting the PUBLIC_NAMESERVERS environment
+            // variable to a comma-separated set of fully-qualified names (with or
+            // without trailing dots).
+            let ns_env = std::env::var("PUBLIC_NAMESERVERS").unwrap_or_else(|_| {
+                "ns1.my-dns.com.,ns2.my-dns.com.".to_string()
+            });
+            let ns_values: Vec<String> = ns_env
+                .split(',')
+                .filter_map(|s| {
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() { None } else if trimmed.ends_with('.') {
+                        Some(trimmed.to_string())
+                    } else {
+                        Some(format!("{}.", trimmed))
+                    }
+                })
+                .collect();
+
+            for ns_value in ns_values.iter() {
                 let ns_id = Uuid::new_v4().to_string();
                 if let Err(e) = (&*data.db).execute(
                     "INSERT INTO records (id, zone_id, name, type, value, ttl) VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, $6)",
-                    &[&ns_id, &zone_id_str, &"@", &"NS", &ns_value, &3600]
+                    &[&ns_id, &zone_id_str, &"@", &"NS", ns_value, &3600]
                 ).await {
                     warn!("Failed to add default NS record: {}", e);
                 }
             }
             
-            // Add default SOA record
+            // Add default SOA record (serial will be bumped later during file
+            // generation).
             let soa_id = Uuid::new_v4().to_string();
-            let soa_value = format!("ns1.my-dns.com. hostmaster.{} 1 3600 3600 604800 3600", domain.trim_end_matches('.'));
+            let soa_value = format!(
+                "ns1.{} hostmaster.{} 1 3600 3600 604800 3600",
+                domain.trim_end_matches('.'),
+                domain.trim_end_matches('.')
+            );
             if let Err(e) = (&*data.db).execute(
                 "INSERT INTO records (id, zone_id, name, type, value, ttl) VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, $6)",
                 &[&soa_id, &zone_id_str, &"@", &"SOA", &soa_value, &3600]
@@ -1554,6 +1526,7 @@ async fn push_config_to_agents(
         record_type: String,
         value: String,
         ttl: u32,
+        priority: Option<i32>,
     }
 
     #[derive(Serialize, Clone)]
@@ -1564,6 +1537,7 @@ async fn push_config_to_agents(
         record_type: String,
         value: String,
         ttl: u32,
+        priority: i32,
     }
 
     async fn create_record(
@@ -1590,6 +1564,14 @@ async fn push_config_to_agents(
         }
         if body.ttl == 0 {
             return HttpResponse::BadRequest().json(serde_json::json!({"error": "TTL must be greater than 0"}));
+        }
+        if let Err(e) = validate_record_value(&body.record_type, &body.value) {
+            return HttpResponse::BadRequest().json(serde_json::json!({"error": e}));
+        }
+        if let Some(priority) = body.priority {
+            if priority < 0 {
+                return HttpResponse::BadRequest().json(serde_json::json!({"error": "priority must be non‑negative"}));
+            }
         }
         
         // Check zone ownership
@@ -1618,10 +1600,11 @@ async fn push_config_to_agents(
         let id = Uuid::new_v4();
         let id_str = id.to_string();
         let ttl: i32 = body.ttl as i32;
+        let priority: i32 = body.priority.unwrap_or(0);
     
         match (&*data.db).execute(
-            "INSERT INTO records (id, zone_id, name, type, value, ttl) VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, $6)",
-            &[&id_str, &zone_id_str, &body.name, &body.record_type, &body.value, &ttl]
+            "INSERT INTO records (id, zone_id, name, type, value, ttl, priority) VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, $6, $7)",
+            &[&id_str, &zone_id_str, &body.name, &body.record_type, &body.value, &ttl, &priority]
         ).await {
             Ok(_) => {
                 info!("Created record: {} ({}) in zone: {}", body.name, body.record_type, zone_id_str);
@@ -1666,6 +1649,7 @@ async fn push_config_to_agents(
             record_type: r.try_get(3).unwrap_or_default(),
             value: r.try_get(4).unwrap_or_default(),
             ttl: r.try_get::<_, i32>(5).unwrap_or(0) as u32,
+            priority: r.try_get::<_, i32>(6).unwrap_or(0),
         }).collect();
     
         HttpResponse::Ok().json(records)
@@ -1677,6 +1661,7 @@ async fn push_config_to_agents(
         record_type: Option<String>,
         value: Option<String>,
         ttl: Option<u32>,
+        priority: Option<i32>,
     }
 
     async fn update_record(
@@ -1691,6 +1676,20 @@ async fn push_config_to_agents(
     
         let (zone_id, record_id) = path.into_inner();
     
+        // Check ownership similar to create_record/delete_record
+        let owner_check = (&*data.db).query_opt(
+            "SELECT owner FROM zones WHERE CAST(id AS varchar) = $1",
+            &[&zone_id]
+        ).await;
+        let zone_owner: Option<String> = match owner_check {
+            Ok(Some(row)) => row.try_get(0).ok(),
+            _ => None
+        };
+        let tok = auth_from_header(&req, &data.jwt_secret).unwrap();
+        if tok.claims.role != "admin" && zone_owner.as_ref() != Some(&tok.claims.sub) {
+            return HttpResponse::Forbidden().json(ErrorResponse { error: "access denied".to_string(), details: None });
+        }
+
         // Build dynamic update query
         let mut updates = vec![];
         let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![];
@@ -1718,6 +1717,15 @@ async fn push_config_to_agents(
             params.push(&ttl_str);
             param_idx += 1;
         }
+        if let Some(priority) = body.priority {
+            if priority < 0 {
+                return HttpResponse::BadRequest().body("priority must be non-negative");
+            }
+            let pr_str = priority.to_string();
+            updates.push(format!("priority = ${}", param_idx));
+            params.push(&pr_str);
+            param_idx += 1;
+        }
     
         if updates.is_empty() {
             return HttpResponse::BadRequest().body("no fields to update");
@@ -1738,6 +1746,9 @@ async fn push_config_to_agents(
                 if count == 0 {
                     HttpResponse::NotFound().finish()
                 } else {
+                    // regenerate zone files so on-disk data reflects the change
+                    let out_dir = std::env::var("HICKORY_DNS_DIR").unwrap_or_else(|_| "/etc/hickory".to_string());
+                    let _ = zone_file_generator::generate_all(&out_dir, data.inner.db.clone()).await;
                     HttpResponse::Ok().finish()
                 }
             }
@@ -1785,6 +1796,8 @@ async fn push_config_to_agents(
                     HttpResponse::NotFound().json(ErrorResponse { error: "record not found".to_string(), details: None })
                 } else {
                     info!("Deleted record: {} from zone: {}", record_id, zone_id);
+                    let out_dir = std::env::var("HICKORY_DNS_DIR").unwrap_or_else(|_| "/etc/hickory".to_string());
+                    let _ = zone_file_generator::generate_all(&out_dir, data.inner.db.clone()).await;
                     HttpResponse::Ok().json(ApiResponse { success: true, data: Some(()), error: None })
                 }
             }
@@ -1957,6 +1970,9 @@ async fn push_config_to_agents(
             }
         }
         
+        // regenerate all files now that the zone metadata has changed
+        let out_dir = std::env::var("HICKORY_DNS_DIR").unwrap_or_else(|_| "/etc/hickory".to_string());
+        let _ = zone_file_generator::generate_all(&out_dir, data.inner.db.clone()).await;
         HttpResponse::Ok().json(ApiResponse { success: true, data: Some(serde_json::json!({"zone_id": zone_id})), error: None })
     }
 
@@ -2043,6 +2059,9 @@ async fn push_config_to_agents(
             }
         }
         
+        // after importing, we want the on-disk data to match the database
+        let out_dir = std::env::var("HICKORY_DNS_DIR").unwrap_or_else(|_| "/etc/hickory".to_string());
+        let _ = zone_file_generator::generate_all(&out_dir, data.inner.db.clone()).await;
         HttpResponse::Ok().json(serde_json::json!({
             "imported": imported,
             "zone_id": zone_id
@@ -2084,6 +2103,8 @@ async fn push_config_to_agents(
                     HttpResponse::NotFound().json(ErrorResponse { error: "zone not found".to_string(), details: None })
                 } else {
                     info!("Deleted zone: {}", zone_id);
+                    let out_dir = std::env::var("HICKORY_DNS_DIR").unwrap_or_else(|_| "/etc/hickory".to_string());
+                    let _ = zone_file_generator::generate_all(&out_dir, data.inner.db.clone()).await;
                     HttpResponse::Ok().json(ApiResponse { success: true, data: Some(()), error: None })
                 }
             }
@@ -2176,23 +2197,13 @@ async fn main() -> std::io::Result<()> {
         std::fs::read(p).ok().and_then(|b| geodns::GeoDB::open_from_bytes(b).ok())
     });
 
-    let dns_manager = Arc::new(DnsManager::new());
-    let full_state = FullState { inner: app_state.clone(), geo: std::sync::Arc::new(tokio::sync::Mutex::new(GeoState { db: geo_db })), processes: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())), dns_manager: dns_manager.clone() };
+    let full_state = FullState { inner: app_state.clone(), geo: std::sync::Arc::new(tokio::sync::Mutex::new(GeoState { db: geo_db })), processes: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())) };
 
-    // Auto-start DNS server on startup using DB-backed handler. Bind address is configured
-    // via HICKORY_DNS_BIND (default 0.0.0.0:53). Errors are logged but don't stop control API.
-    let bind_env = std::env::var("HICKORY_DNS_BIND").unwrap_or_else(|_| "0.0.0.0:53".to_string());
-    if let Ok(bind_addr) = bind_env.parse::<std::net::SocketAddr>() {
-        let db_client = app_state.db.clone();
-        tokio::spawn(async move {
-            if let Err(e) = dns_manager.start_server("default", bind_addr, db_client).await {
-                tracing::warn!("failed to start default dns server: {}", e);
-            } else {
-                tracing::info!("default dns server started on {}", bind_addr);
-            }
-        });
-    } else {
-        tracing::warn!("invalid HICKORY_DNS_BIND '{}', skipping auto-start", bind_env);
+    // generate disk configuration immediately so that an external dns-server
+    // container will have something to read when it first starts up.
+    let out_dir = std::env::var("HICKORY_DNS_DIR").unwrap_or_else(|_| "/etc/hickory".to_string());
+    if let Err(e) = generate_all(&out_dir, app_state.db.clone()).await {
+        warn!("initial zone file generation failed: {}", e);
     }
 
     // Prometheus metrics middleware
@@ -2246,11 +2257,7 @@ async fn main() -> std::io::Result<()> {
             .route("/api/v1/agents", web::get().to(list_agents))
             .route("/api/v1/agents/{id}/config", web::get().to(agent_get_config))
             .route("/api/v1/agents/{id}/token/rotate", web::post().to(rotate_agent_token))
-            // DNS Control
-            .route("/api/v1/dns/start", web::post().to(start_dns_server))
-            .route("/api/v1/dns/stop", web::post().to(stop_dns_server))
-            .route("/api/v1/dns/status", web::get().to(dns_status))
-            .route("/api/v1/dns/reload", web::post().to(dns_reload))
+            // DNS Control (generation endpoint only, server is external)
             .route("/api/v1/dns/generate", web::post().to(generate_dns_files))
             // GeoRules
             .route("/api/v1/georules", web::post().to(create_georule))

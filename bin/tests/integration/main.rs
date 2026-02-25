@@ -16,3 +16,4 @@ mod sqlite_tests;
 mod store_file_tests;
 mod store_sqlite_tests;
 mod txt_tests;
+mod zone_file_reload;

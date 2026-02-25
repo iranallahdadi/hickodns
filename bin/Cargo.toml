@@ -111,7 +111,9 @@ webpki-roots.workspace = true
 # metrics tests
 reqwest = { workspace = true, default-features = false }
 prometheus-parse = { workspace = true }
-
+ 
+ # helper library used by integration tests
+ control_api = { path = "../crates/control_api" }
 [lints]
 workspace = true
 

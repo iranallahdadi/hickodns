@@ -31,6 +31,8 @@ services:
       - ./env/api.env
     environment:
       RUST_LOG: info,control_api=debug
+      # comma-separated list of authoritative nameservers used when creating zones
+      PUBLIC_NAMESERVERS: "${PUBLIC_NAMESERVERS:-ns1.my-dns.com.,ns2.my-dns.com.}"
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
