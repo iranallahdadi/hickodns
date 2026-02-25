@@ -112,7 +112,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push control-api
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: ./crates/control_api
           push: true
@@ -122,7 +122,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Build and push agent
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: ./crates/agent
           push: true
@@ -132,7 +132,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Build and push UI
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: ./web/ui
           push: true
