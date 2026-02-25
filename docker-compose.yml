@@ -12,7 +12,7 @@ services:
       - "127.0.0.1:5432:5432"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d hickory"]
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -33,6 +33,7 @@ services:
       RUST_LOG: info,control_api=debug
       # comma-separated list of authoritative nameservers used when creating zones
       PUBLIC_NAMESERVERS: "${PUBLIC_NAMESERVERS:-ns1.my-dns.com.,ns2.my-dns.com.}"
+      HICKORY_DNS_DIR: "/etc/hickory"
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
@@ -51,7 +52,6 @@ services:
       - hickory-network
     security_opt:
       - no-new-privileges:true
-    read_only: true
     tmpfs:
       - /tmp:size=10m,mode=1777
 
@@ -85,10 +85,15 @@ services:
       - "${DOT_PORT:-853}:853/tcp"  # DoT
     volumes:
       - ./deploy/dns:/etc/hickory:ro
-    command: ["-c", "/etc/hickory/named.toml", "-p", "53"]
     depends_on:
-      - control-api
+      control-api:
+        condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "dig", "@127.0.0.1", "-p", "53", "+short", ".", "NS"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
     networks:
       - hickory-network
     security_opt:

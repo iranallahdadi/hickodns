@@ -200,7 +200,7 @@ pub async fn generate_all(base_dir: &str, db: Arc<Client>) -> anyhow::Result<()>
 
                 let recs = db
                     .query(
-                        "SELECT name, type, value, ttl, priority FROM records WHERE zone_id = $1",
+                        "SELECT name, record_type, value, ttl, priority FROM records WHERE zone_id = $1",
                         &[&zone_id],
                     )
                     .await
@@ -210,7 +210,7 @@ pub async fn generate_all(base_dir: &str, db: Arc<Client>) -> anyhow::Result<()>
                 for r in recs {
                     list.push(RecordRow {
                         name: r.try_get("name").unwrap_or_default(),
-                        rtype: r.try_get("type").unwrap_or_default(),
+                        rtype: r.try_get("record_type").unwrap_or_default(),
                         value: r.try_get("value").unwrap_or_default(),
                         ttl: r.try_get("ttl").unwrap_or(3600),
                         priority: r.try_get("priority").unwrap_or(0),

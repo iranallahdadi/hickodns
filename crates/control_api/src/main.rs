@@ -250,12 +250,13 @@ async fn migrate_db(client: &tokio_postgres::Client) -> Result<(), tokio_postgre
             id UUID PRIMARY KEY,
             zone_id UUID REFERENCES zones(id) ON DELETE CASCADE,
             name TEXT NOT NULL,
-            type TEXT NOT NULL,
+            record_type TEXT NOT NULL,
             value TEXT NOT NULL,
             ttl INT NOT NULL DEFAULT 3600,
             priority INT DEFAULT 0,
             created_at TIMESTAMPTZ DEFAULT now(),
-            updated_at TIMESTAMPTZ DEFAULT now()
+            updated_at TIMESTAMPTZ DEFAULT now(),
+            UNIQUE(zone_id, name, record_type)
         );"
     ).await {
         warn!("Failed to create records table: {}", e);
@@ -391,7 +392,7 @@ async fn migrate_db(client: &tokio_postgres::Client) -> Result<(), tokio_postgre
         "CREATE INDEX IF NOT EXISTS idx_zones_owner ON zones(owner);
          CREATE INDEX IF NOT EXISTS idx_zones_domain ON zones(domain);
          CREATE INDEX IF NOT EXISTS idx_records_zone_id ON records(zone_id);
-         CREATE INDEX IF NOT EXISTS idx_records_name_type ON records(name, type);
+         CREATE INDEX IF NOT EXISTS idx_records_name_type ON records(name, record_type);
          CREATE INDEX IF NOT EXISTS idx_georules_zone_id ON georules(zone_id);
          CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id);
          CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
@@ -1107,54 +1108,25 @@ async fn list_agents(data: web::Data<AppState>, req: HttpRequest) -> impl Respon
     }
 }
 
-#[derive(Deserialize)]
-#[allow(dead_code)]
-struct StartDnsReq {
-    id: String,
-    bind: String,
-}
-
-async fn start_dns_server(body: web::Json<StartDnsReq>, data: web::Data<FullState>, req: HttpRequest) -> impl Responder {
-    // require admin
+async fn generate_dns_files(data: web::Data<FullState>, req: HttpRequest) -> impl Responder {
+    // this endpoint is retained for debugging but is not required by the
+    // production architecture; generation is automatic on every write.
     if let Some(tok) = auth_from_header(&req, &data.inner.jwt_secret) {
         if tok.claims.role != "admin" {
-            return HttpResponse::Forbidden().body("admin role required");
+            return HttpResponse::Forbidden().json(serde_json::json!({"error": "admin role required"}));
         }
     } else {
-        return HttpResponse::Unauthorized().finish();
+        return HttpResponse::Unauthorized().json(serde_json::json!({"error": "unauthorized"}));
     }
 
-    let server_id = body.id.clone();
-    let bind_addr = if body.bind.is_empty() { "0.0.0.0".to_string() } else {
-        body.bind.split(':').next().unwrap_or("0.0.0.0").to_string()
-    };
-    let port: u16 = if body.bind.is_empty() { 53 } else {
-        body.bind.split(':').last().unwrap_or("53").parse().unwrap_or(53)
-    };
-
-    // Build bind socket addr
-    let bind_str = if body.bind.is_empty() { "0.0.0.0:53".to_string() } else { format!("{}:{}", bind_addr, port) };
-    let sock: std::net::SocketAddr = match bind_str.parse() {
-        Ok(s) => s,
-        Err(e) => return HttpResponse::BadRequest().body(format!("invalid bind address: {}", e)),
-    };
-
-    // Start in-process DNS server backed by DB
-    let dm = data.dns_manager.clone();
-    let db_client = data.inner.db.clone();
-    match dm.start_server(&server_id, sock, db_client).await {
-        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status":"started","server_id": server_id, "bind": bind_str})),
+    match data.inner.dns_manager.regenerate_zones(data.inner.db.clone()).await {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "generated"})),
         Err(e) => {
-            warn!("failed starting dns server: {}", e);
-            HttpResponse::InternalServerError().body("failed to start dns server")
+            warn!("failed to generate zone files: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({"error": format!("generation failed: {}", e)}))
         }
     }
 }
-
-
-
-
-
 async fn generate_dns_files(data: web::Data<FullState>, req: HttpRequest) -> impl Responder {
     // this endpoint is retained for debugging but is not required by the
     // production architecture; generation is automatic on every write.
@@ -1584,7 +1556,7 @@ async fn push_config_to_agents(
         let priority: i32 = body.priority.unwrap_or(0);
     
         match (&*data.db).execute(
-            "INSERT INTO records (id, zone_id, name, type, value, ttl, priority) VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, $6, $7)",
+            "INSERT INTO records (id, zone_id, name, record_type, value, ttl, priority) VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, $6, $7)",
             &[&id_str, &zone_id_str, &body.name, &body.record_type, &body.value, &ttl, &priority]
         ).await {
             Ok(_) => {
@@ -1625,7 +1597,7 @@ async fn push_config_to_agents(
         let zone_id_str = zone_id.into_inner();
         let rows = (&*data.db)
             .query(
-                "SELECT CAST(id AS varchar), CAST(zone_id AS varchar), name, type, value, ttl FROM records WHERE CAST(zone_id AS varchar) = $1 ORDER BY name",
+                "SELECT CAST(id AS varchar), CAST(zone_id AS varchar), name, record_type, value, ttl, priority FROM records WHERE CAST(zone_id AS varchar) = $1 ORDER BY name",
                 &[&zone_id_str]
             )
             .await
@@ -1690,7 +1662,7 @@ async fn push_config_to_agents(
             param_idx += 1;
         }
         if let Some(ref record_type) = body.record_type {
-            updates.push(format!("type = ${}", param_idx));
+            updates.push(format!("record_type = ${}", param_idx));
             params.push(record_type);
             param_idx += 1;
         }
@@ -1996,7 +1968,7 @@ async fn push_config_to_agents(
         let domain: String = zone_row.try_get(0).unwrap_or_default();
         
         let records = (&*data.db).query(
-            "SELECT name, type, value, ttl FROM records WHERE CAST(zone_id AS varchar) = $1",
+            "SELECT name, record_type, value, ttl FROM records WHERE CAST(zone_id AS varchar) = $1",
             &[&zone_id]
         ).await.unwrap_or_default();
         
@@ -2005,10 +1977,10 @@ async fn push_config_to_agents(
         
         for r in records {
             let name: String = r.try_get(0).unwrap_or_default();
-            let typ: String = r.try_get(1).unwrap_or_default();
+            let record_type: String = r.try_get(1).unwrap_or_default();
             let value: String = r.try_get(2).unwrap_or_default();
             let ttl: i32 = r.try_get(3).unwrap_or(0);
-            zone_content.push_str(&format!("{} {} IN {} {}\n", if name.is_empty() || name == "@" { "@" } else { &name }, ttl, typ, value));
+            zone_content.push_str(&format!("{} {} IN {} {}\n", if name.is_empty() || name == "@" { "@" } else { &name }, ttl, record_type, value));
         }
         
         HttpResponse::Ok()
