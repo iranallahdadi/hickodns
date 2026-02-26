@@ -305,7 +305,7 @@ impl ZoneConfig {
                 });
                 let mut engine = geodns::GeoRuleEngine::new(db);
                 engine.set_rules(rules);
-                let geo_handler = crate::zone_handler::geodns::GeoZoneHandler::new(
+                let geo_handler = hickory_server::zone_handler::geodns::GeoZoneHandler::new(
                     zone_name.clone(),
                     engine,
                 );

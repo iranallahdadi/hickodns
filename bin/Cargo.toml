@@ -91,6 +91,10 @@ hickory-resolver.workspace = true
 hickory-server = { workspace = true, features = ["toml"] }
 hostname.workspace = true
 notify = "6"
+
+# GeoDNS support dependencies
+geodns = { path = "../crates/geodns" }
+uuid = { version = "1", features = ["v4"] }
 metrics = { workspace = true, optional = true }
 metrics-exporter-prometheus = { workspace = true, optional = true }
 metrics-process = { workspace = true, optional = true }

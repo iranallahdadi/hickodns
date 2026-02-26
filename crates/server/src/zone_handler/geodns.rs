@@ -131,4 +131,45 @@ mod tests {
         let result = futures_util::executor::block_on(handler.lookup(&info.query.name.to_lowercase(), RecordType::A, Some(&info), LookupOptions::default()));
         assert!(matches!(result, LookupControlFlow::Skip));
     }
+
+    #[test]
+    fn test_geo_handler_match() {
+        let origin = Name::from_str("example.com.").unwrap();
+        let mut rule = geodns::GeoRule {
+            id: "r2".into(),
+            match_type: "country".into(),
+            match_value: "US".into(),
+            target: "1.2.3.4".into(),
+            priority: 0,
+            enabled: true,
+            record_name: None,
+            record_type: None,
+        };
+        let mut engine = geodns::GeoRuleEngine::new(None);
+        engine.set_rules(vec![rule]);
+        let handler = GeoZoneHandler::new(origin.clone(), engine);
+
+        // simulate match by bypassing DB check: engine.evaluate will still return target because country_opt None -> matches rule? Actually in matches closure for country, it returns false if country_opt is None. To simulate a match, we can create a rule with match_type "default".
+        let mut default_engine = geodns::GeoRuleEngine::new(None);
+        default_engine.set_rules(vec![geodns::GeoRule {
+            id: "r_default".into(),
+            match_type: "default".into(),
+            match_value: "".into(),
+            target: "5.6.7.8".into(),
+            priority: 0,
+            enabled: true,
+            record_name: None,
+            record_type: None,
+        }]);
+        let default_handler = GeoZoneHandler::new(origin, default_engine);
+        let info = make_reqinfo("10.0.0.1");
+        match futures_util::executor::block_on(default_handler.lookup(&info.query.name.to_lowercase(), RecordType::A, Some(&info), LookupOptions::default())) {
+            LookupControlFlow::Break(Ok(AuthLookup::Records(r))) => {
+                let recs = r.records();
+                assert_eq!(recs.len(), 1);
+                assert_eq!(recs[0].rtype(), RecordType::A);
+            }
+            other => panic!("expected break with records, got {:?}", other),
+        }
+    }
 }

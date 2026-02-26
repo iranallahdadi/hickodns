@@ -14,6 +14,7 @@ export default function GeoRules(){
   const [enabled, setEnabled] = React.useState(true)
   const [recordName, setRecordName] = React.useState('')
   const [recordType, setRecordType] = React.useState('')
+  const [editingRule, setEditingRule] = React.useState(null)
   const [testIp, setTestIp] = React.useState('8.8.8.8')
   const [resolveResult, setResolveResult] = React.useState(null)
   const [loading, setLoading] = React.useState(false)
@@ -39,14 +40,23 @@ export default function GeoRules(){
 
   const create = async () => {
     if (!zone || !matchValue || !target) return
-    try { 
-      await api.post('/api/v1/georules', { 
-        zone_id: zone, match_type: matchType, match_value: matchValue, target,
-        priority, enabled, record_name: recordName || null, record_type: recordType || null
-      }); 
+    try {
+      if (editingRule) {
+        await api.put(`/api/v1/georules/${editingRule.id}`, {
+          zone_id: zone, match_type: matchType, match_value: matchValue, target,
+          priority, enabled, record_name: recordName || null, record_type: recordType || null
+        });
+      } else {
+        await api.post('/api/v1/georules', { 
+          zone_id: zone, match_type: matchType, match_value: matchValue, target,
+          priority, enabled, record_name: recordName || null, record_type: recordType || null
+        });
+      }
+      // reset form
       setZone(''); setPriority(0); setEnabled(true); setRecordName(''); setRecordType('');
-      load() 
-    } catch (e) { alert('Error creating rule') }
+      setEditingRule(null);
+      load()
+    } catch (e) { alert('Error saving rule') }
   }
 
   const remove = async (id)=>{ 
@@ -55,6 +65,18 @@ export default function GeoRules(){
       await api.delete(`/api/v1/georules/${id}`); 
       load() 
     } catch(e){ alert('Delete failed') } 
+  }
+
+  const startEditRule = (r) => {
+    setEditingRule(r);
+    setZone(r.zone_id);
+    setMatchType(r.match_type);
+    setMatchValue(r.match_value);
+    setTarget(r.target);
+    setPriority(r.priority || 0);
+    setEnabled(r.enabled);
+    setRecordName(r.record_name || '');
+    setRecordType(r.record_type || '');
   }
 
   const testResolve = async () => {
@@ -159,9 +181,14 @@ export default function GeoRules(){
               onClick={create}
             >
               <Plus className="w-5 h-5" />
-              <span>Add Rule</span>
+              <span>{editingRule ? 'Update Rule' : 'Add Rule'}</span>
             </button>
           </div>
+          {editingRule && (
+            <div className="col-span-full text-right">
+              <button className="text-sm text-gray-600 hover:underline" onClick={()=>setEditingRule(null)}>Cancel</button>
+            </div>
+          )}
         </div>
       </motion.div>
 
@@ -270,6 +297,12 @@ export default function GeoRules(){
                       {r.record_name || '-'}{r.record_type ? `/${r.record_type}` : ''}
                     </td>
                     <td className="px-6 py-4 text-right">
+                      <button 
+                        onClick={()=>startEditRule(r)}
+                        className="text-blue-600 hover:text-blue-800 p-1 rounded hover:bg-blue-50"
+                      >
+                        <ChevronRight className="w-4 h-4" />
+                      </button>
                       <button 
                         onClick={()=>remove(r.id)}
                         className="text-red-600 hover:text-red-800 p-1 rounded hover:bg-red-50"
