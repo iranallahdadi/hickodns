@@ -1448,6 +1448,7 @@ dependencies = [
  "data-encoding",
  "futures-executor",
  "futures-util",
+ "geodns",
  "h2 0.4.13",
  "h3",
  "h3-quinn",
@@ -1470,6 +1471,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

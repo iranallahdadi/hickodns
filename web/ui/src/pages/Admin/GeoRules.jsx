@@ -10,6 +10,10 @@ export default function GeoRules(){
   const [matchType, setMatchType] = React.useState('country')
   const [matchValue, setMatchValue] = React.useState('US')
   const [target, setTarget] = React.useState('192.0.2.1')
+  const [priority, setPriority] = React.useState(0)
+  const [enabled, setEnabled] = React.useState(true)
+  const [recordName, setRecordName] = React.useState('')
+  const [recordType, setRecordType] = React.useState('')
   const [testIp, setTestIp] = React.useState('8.8.8.8')
   const [resolveResult, setResolveResult] = React.useState(null)
   const [loading, setLoading] = React.useState(false)
@@ -36,8 +40,11 @@ export default function GeoRules(){
   const create = async () => {
     if (!zone || !matchValue || !target) return
     try { 
-      await api.post('/api/v1/georules', { zone_id: zone, match_type: matchType, match_value: matchValue, target }); 
-      setZone(''); 
+      await api.post('/api/v1/georules', { 
+        zone_id: zone, match_type: matchType, match_value: matchValue, target,
+        priority, enabled, record_name: recordName || null, record_type: recordType || null
+      }); 
+      setZone(''); setPriority(0); setEnabled(true); setRecordName(''); setRecordType('');
       load() 
     } catch (e) { alert('Error creating rule') }
   }
@@ -65,6 +72,15 @@ export default function GeoRules(){
     return z ? z.domain : zoneId
   }
 
+  const toggleEnabled = async (rule) => {
+    try {
+      await api.put(`/api/v1/georules/${rule.id}`, { enabled: !rule.enabled });
+      load();
+    } catch (e) {
+      alert('Failed to update rule');
+    }
+  }
+
   return (
     <div className="space-y-6">
       <motion.div 
@@ -79,7 +95,7 @@ export default function GeoRules(){
           <h3 className="text-xl font-bold text-gray-800">GeoDNS Rules</h3>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-7 gap-4">
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Zone</label>
             <select 
@@ -120,6 +136,22 @@ export default function GeoRules(){
               value={target} 
               onChange={e=>setTarget(e.target.value)} 
             />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Priority</label>
+            <input type="number" min="0" className="w-full border border-gray-300 rounded-lg px-4 py-2 focus:ring-2 focus:ring-green-500 focus:border-transparent" value={priority} onChange={e=>setPriority(parseInt(e.target.value)||0)} />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Enabled</label>
+            <input type="checkbox" checked={enabled} onChange={e=>setEnabled(e.target.checked)} className="h-5 w-5" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Record Name</label>
+            <input className="w-full border border-gray-300 rounded-lg px-4 py-2 focus:ring-2 focus:ring-green-500 focus:border-transparent" placeholder="optional" value={recordName} onChange={e=>setRecordName(e.target.value)} />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Record Type</label>
+            <input className="w-full border border-gray-300 rounded-lg px-4 py-2 focus:ring-2 focus:ring-green-500 focus:border-transparent" placeholder="e.g., A, AAAA" value={recordType} onChange={e=>setRecordType(e.target.value)} />
           </div>
           <div className="flex items-end">
             <button 
@@ -199,9 +231,12 @@ export default function GeoRules(){
               <thead className="bg-gray-50">
                 <tr>
                   <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Zone</th>
-                  <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Match Type</th>
+                  <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Match</th>
                   <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Value</th>
                   <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Target</th>
+                  <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Pri</th>
+                  <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Enabled</th>
+                  <th className="px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Record</th>
                   <th className="px-6 py-3 text-right text-xs font-semibold text-gray-600 uppercase tracking-wider">Actions</th>
                 </tr>
               </thead>
@@ -227,6 +262,13 @@ export default function GeoRules(){
                       </div>
                     </td>
                     <td className="px-6 py-4 text-sm text-gray-600 font-mono">{r.target}</td>
+                    <td className="px-6 py-4 text-sm text-gray-600">{r.priority}</td>
+                    <td className="px-6 py-4">
+                      <input type="checkbox" checked={r.enabled} onChange={()=>toggleEnabled(r)} className="h-4 w-4" />
+                    </td>
+                    <td className="px-6 py-4 text-sm text-gray-600">
+                      {r.record_name || '-'}{r.record_type ? `/${r.record_type}` : ''}
+                    </td>
                     <td className="px-6 py-4 text-right">
                       <button 
                         onClick={()=>remove(r.id)}

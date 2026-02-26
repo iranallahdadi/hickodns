@@ -134,6 +134,7 @@ struct ZoneWithOwner {
     owner: String,
     zone_type: String,
     created_at: String,
+    geodns_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -234,6 +235,7 @@ async fn migrate_db(client: &tokio_postgres::Client) -> Result<(), tokio_postgre
             domain TEXT NOT NULL,
             owner UUID REFERENCES users(id) ON DELETE SET NULL,
             zone_type TEXT NOT NULL DEFAULT 'primary',
+            geodns_enabled BOOLEAN DEFAULT true,
             created_at TIMESTAMPTZ DEFAULT now(),
             updated_at TIMESTAMPTZ DEFAULT now(),
             UNIQUE(domain)
@@ -243,6 +245,13 @@ async fn migrate_db(client: &tokio_postgres::Client) -> Result<(), tokio_postgre
         return Err(e);
     }
     info!("Zones table ready");
+    // Ensure existing installations get the new column
+    if let Err(e) = client.batch_execute(
+        "ALTER TABLE zones ADD COLUMN IF NOT EXISTS geodns_enabled BOOLEAN DEFAULT true;"
+    ).await {
+        warn!("Failed to add geodns_enabled to zones: {}", e);
+        return Err(e);
+    }
     
     // Records table
     if let Err(e) = client.batch_execute(
@@ -292,6 +301,8 @@ async fn migrate_db(client: &tokio_postgres::Client) -> Result<(), tokio_postgre
             target TEXT NOT NULL,
             priority INT DEFAULT 0,
             enabled BOOLEAN DEFAULT true,
+            record_name TEXT,
+            record_type TEXT,
             created_at TIMESTAMPTZ DEFAULT now(),
             updated_at TIMESTAMPTZ DEFAULT now()
         );"
@@ -300,6 +311,27 @@ async fn migrate_db(client: &tokio_postgres::Client) -> Result<(), tokio_postgre
         return Err(e);
     }
     info!("Georules table ready");
+    // ensure existing installations have new columns
+    if let Err(e) = client.batch_execute(
+        "ALTER TABLE georules ADD COLUMN IF NOT EXISTS priority INT DEFAULT 0;"
+    ).await {
+        warn!("failed to add priority column to georules: {}", e);
+    }
+    if let Err(e) = client.batch_execute(
+        "ALTER TABLE georules ADD COLUMN IF NOT EXISTS enabled BOOLEAN DEFAULT true;"
+    ).await {
+        warn!("failed to add enabled column to georules: {}", e);
+    }
+    if let Err(e) = client.batch_execute(
+        "ALTER TABLE georules ADD COLUMN IF NOT EXISTS record_name TEXT;"
+    ).await {
+        warn!("failed to add record_name column to georules: {}", e);
+    }
+    if let Err(e) = client.batch_execute(
+        "ALTER TABLE georules ADD COLUMN IF NOT EXISTS record_type TEXT;"
+    ).await {
+        warn!("failed to add record_type column to georules: {}", e);
+    }
     
     // ACLs table
     if let Err(e) = client.batch_execute(
@@ -1153,6 +1185,14 @@ struct CreateGeoRuleReq {
     match_type: String,
     match_value: String,
     target: String,
+    #[serde(default)]
+    priority: Option<i32>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    record_name: Option<String>,
+    #[serde(default)]
+    record_type: Option<String>,
 }
 
 async fn create_georule(body: web::Json<CreateGeoRuleReq>, data: web::Data<FullState>, req: HttpRequest) -> impl Responder {
@@ -1164,18 +1204,134 @@ async fn create_georule(body: web::Json<CreateGeoRuleReq>, data: web::Data<FullS
     };
     let id_str = id.to_string();
     let zone_str = zone_uuid.to_string();
-    let res = (&*data.inner.db).execute("INSERT INTO georules (id, zone_id, match_type, match_value, target) VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5)", &[&id_str, &zone_str, &body.match_type, &body.match_value, &body.target]).await;
+    let res = (&*data.inner.db).execute(
+        "INSERT INTO georules (id, zone_id, match_type, match_value, target, priority, enabled, record_name, record_type) \
+         VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, $6, $7, $8, $9)",
+        &[&id_str, &zone_str, &body.match_type, &body.match_value, &body.target,
+          &body.priority.unwrap_or(0), &body.enabled.unwrap_or(true), &body.record_name, &body.record_type]
+    ).await;
     match res {
-        Ok(_) => HttpResponse::Created().json(serde_json::json!({"id": id.to_string()})),
+        Ok(_) => {
+            // regenerate configuration so DNS servers pick up new rule
+            if let Err(e) = data.inner.dns_manager.regenerate_zones(data.inner.db.clone()).await {
+                warn!("Failed to regenerate zones after georule creation: {}", e);
+            }
+            HttpResponse::Created().json(serde_json::json!({"id": id.to_string()}))
+        }
         Err(e) => { warn!("create_georule error: {}", e); HttpResponse::InternalServerError().finish() }
     }
 }
 
 async fn list_georules(data: web::Data<FullState>, req: HttpRequest) -> impl Responder {
     if auth_from_header(&req, &data.inner.jwt_secret).is_none() { return HttpResponse::Unauthorized().finish(); }
-    let rows = (&*data.inner.db).query("SELECT CAST(id AS varchar), CAST(zone_id AS varchar), match_type, match_value, target FROM georules", &[]).await.unwrap_or_default();
-    let out: Vec<_> = rows.into_iter().map(|r| serde_json::json!({"id": r.try_get::<_, String>(0).unwrap_or_default(), "zone_id": r.try_get::<_, String>(1).unwrap_or_default(), "match_type": r.try_get::<_, String>(2).unwrap_or_default(), "match_value": r.try_get::<_, String>(3).unwrap_or_default(), "target": r.try_get::<_, String>(4).unwrap_or_default()})).collect();
+    let rows = (&*data.inner.db).query(
+        "SELECT CAST(id AS varchar), CAST(zone_id AS varchar), match_type, match_value, target, priority, enabled, record_name, record_type FROM georules",
+        &[]
+    ).await.unwrap_or_default();
+    let out: Vec<_> = rows.into_iter().map(|r| serde_json::json!({
+        "id": r.try_get::<_, String>(0).unwrap_or_default(),
+        "zone_id": r.try_get::<_, String>(1).unwrap_or_default(),
+        "match_type": r.try_get::<_, String>(2).unwrap_or_default(),
+        "match_value": r.try_get::<_, String>(3).unwrap_or_default(),
+        "target": r.try_get::<_, String>(4).unwrap_or_default(),
+        "priority": r.try_get::<_, i32>(5).unwrap_or(0),
+        "enabled": r.try_get::<_, bool>(6).unwrap_or(true),
+        "record_name": r.try_get::<_, Option<String>>(7).unwrap_or(None),
+        "record_type": r.try_get::<_, Option<String>>(8).unwrap_or(None),
+    })).collect();
     HttpResponse::Ok().json(out)
+}
+
+#[derive(Deserialize)]
+struct UpdateGeoRuleReq {
+    match_type: Option<String>,
+    match_value: Option<String>,
+    target: Option<String>,
+    priority: Option<i32>,
+    enabled: Option<bool>,
+    record_name: Option<String>,
+    record_type: Option<String>,
+}
+
+async fn update_georule(
+    path: web::Path<String>,
+    body: web::Json<UpdateGeoRuleReq>,
+    data: web::Data<FullState>,
+    req: HttpRequest,
+) -> impl Responder {
+    if auth_from_header(&req, &data.inner.jwt_secret).is_none() {
+        return HttpResponse::Unauthorized().json(serde_json::json!({"error": "unauthorized"}));
+    }
+    let rule_id = path.into_inner();
+
+    // Build dynamic query parts
+    let mut updates = Vec::new();
+    let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = Vec::new();
+    let mut idx = 1;
+    if let Some(v) = &body.match_type {
+        updates.push(format!("match_type = ${}", idx));
+        params.push(v);
+        idx += 1;
+    }
+    if let Some(v) = &body.match_value {
+        updates.push(format!("match_value = ${}", idx));
+        params.push(v);
+        idx += 1;
+    }
+    if let Some(v) = &body.target {
+        updates.push(format!("target = ${}", idx));
+        params.push(v);
+        idx += 1;
+    }
+    if let Some(v) = body.priority {
+        updates.push(format!("priority = ${}", idx));
+        params.push(&v);
+        idx += 1;
+    }
+    if let Some(v) = body.enabled {
+        updates.push(format!("enabled = ${}", idx));
+        params.push(&v);
+        idx += 1;
+    }
+    if let Some(v) = &body.record_name {
+        updates.push(format!("record_name = ${}", idx));
+        params.push(v);
+        idx += 1;
+    }
+    if let Some(v) = &body.record_type {
+        updates.push(format!("record_type = ${}", idx));
+        params.push(v);
+        idx += 1;
+    }
+
+    if updates.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "no fields to update"}));
+    }
+
+    let set_clause = updates.join(", ");
+    let query = format!(
+        "UPDATE georules SET {} , updated_at = now() WHERE CAST(id AS varchar) = ${}",
+        set_clause, idx
+    );
+    params.push(&rule_id);
+
+    match (&*data.inner.db).execute(&query, &params).await {
+        Ok(count) => {
+            if count == 0 {
+                HttpResponse::NotFound().json(serde_json::json!({"error": "rule not found"}))
+            } else {
+                // regenerate configuration
+                if let Err(e) = data.inner.dns_manager.regenerate_zones(data.inner.db.clone()).await {
+                    warn!("Failed to regenerate zones after georule update: {}", e);
+                }
+                HttpResponse::Ok().json(serde_json::json!({"success": true}))
+            }
+        }
+        Err(e) => {
+            warn!("update_georule error: {}", e);
+            HttpResponse::InternalServerError().json(serde_json::json!({"error": "failed to update rule"}))
+        }
+    }
 }
 
 async fn delete_georule(path: web::Path<String>, data: web::Data<FullState>, req: HttpRequest) -> impl Responder {
@@ -1184,7 +1340,13 @@ async fn delete_georule(path: web::Path<String>, data: web::Data<FullState>, req
     }
     let rule_id = path.into_inner();
     match (&*data.inner.db).execute("DELETE FROM georules WHERE CAST(id AS varchar) = $1", &[&rule_id]).await {
-        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"success": true})),
+        Ok(_) => {
+            // regenerate config after deletion
+            if let Err(e) = data.inner.dns_manager.regenerate_zones(data.inner.db.clone()).await {
+                warn!("Failed to regenerate zones after georule delete: {}", e);
+            }
+            HttpResponse::Ok().json(serde_json::json!({"success": true}))
+        }
         Err(e) => {
             warn!("delete_georule error: {}", e);
             HttpResponse::InternalServerError().json(serde_json::json!({"error": "failed to delete rule"}))
@@ -1195,6 +1357,8 @@ async fn delete_georule(path: web::Path<String>, data: web::Data<FullState>, req
 #[derive(Deserialize)]
 struct CreateZoneReq {
     domain: String,
+    #[serde(default)]
+    geodns_enabled: Option<bool>,
 }
 
 async fn list_zones(data: web::Data<AppState>, req: HttpRequest) -> impl Responder {
@@ -1211,13 +1375,13 @@ async fn list_zones(data: web::Data<AppState>, req: HttpRequest) -> impl Respond
     // Query zones based on role
     let query_result = if tok.claims.role == "admin" {
         (&*data.db).query(
-            "SELECT CAST(id AS varchar), domain, COALESCE(CAST(owner AS varchar), '') as owner, zone_type, created_at::text FROM zones ORDER BY domain",
+            "SELECT CAST(id AS varchar), domain, COALESCE(CAST(owner AS varchar), '') as owner, zone_type, created_at::text, COALESCE(geodns_enabled, true) FROM zones ORDER BY domain",
             &[]
         ).await
     } else {
         let owner_str = tok.claims.sub.clone();
         (&*data.db).query(
-            "SELECT CAST(id AS varchar), domain, COALESCE(CAST(owner AS varchar), '') as owner, zone_type, created_at::text FROM zones WHERE CAST(owner AS varchar) = $1 ORDER BY domain",
+            "SELECT CAST(id AS varchar), domain, COALESCE(CAST(owner AS varchar), '') as owner, zone_type, created_at::text, COALESCE(geodns_enabled, true) FROM zones WHERE CAST(owner AS varchar) = $1 ORDER BY domain",
             &[&owner_str]
         ).await
     };
@@ -1230,6 +1394,7 @@ async fn list_zones(data: web::Data<AppState>, req: HttpRequest) -> impl Respond
                 owner: r.try_get(2).unwrap_or_default(),
                 zone_type: r.try_get(3).unwrap_or_default(),
                 created_at: r.try_get(4).unwrap_or_default(),
+                geodns_enabled: r.try_get(5).unwrap_or(true),
             }).collect();
             HttpResponse::Ok().json(ApiResponse { success: true, data: Some(zones), error: None })
         }
@@ -1259,6 +1424,7 @@ async fn create_zone(body: web::Json<CreateZoneReq>, data: web::Data<AppState>, 
     let zone_id_str = zone_id.to_string();
     let owner_uuid_str = &tok.claims.sub;
     let domain = body.domain.clone();
+    let geodns_enabled = body.geodns_enabled.unwrap_or(true);
     
     // Ensure owner_uuid_str is a valid UUID
     match Uuid::parse_str(owner_uuid_str) {
@@ -1274,8 +1440,8 @@ async fn create_zone(body: web::Json<CreateZoneReq>, data: web::Data<AppState>, 
     
     // Create zone
     match (&*data.db).execute(
-        "INSERT INTO zones (id, domain, owner) VALUES ($1::text::uuid, $2, $3::text::uuid)",
-        &[&zone_id_str, &domain, &owner_uuid_str]
+        "INSERT INTO zones (id, domain, owner, geodns_enabled) VALUES ($1::text::uuid, $2, $3::text::uuid, $4)",
+        &[&zone_id_str, &domain, &owner_uuid_str, &geodns_enabled]
     ).await {
         Ok(_) => {
             info!("Created zone: {} for owner: {}", domain, owner_uuid_str);
@@ -1347,6 +1513,10 @@ async fn create_zone(body: web::Json<CreateZoneReq>, data: web::Data<AppState>, 
 struct GeoResolveRequest {
     zone_id: String,
     client_ip: String,
+    #[serde(default)]
+    record_name: Option<String>,
+    #[serde(default)]
+    record_type: Option<String>,
 }
 
 /// Resolve a DNS response for a zone based on client's geographic location.
@@ -1361,7 +1531,7 @@ async fn resolve_by_geo(body: web::Json<GeoResolveRequest>, data: web::Data<Full
     // Fetch georules for this zone from DB
     let rows = (&*data.inner.db)
         .query(
-            "SELECT CAST(id AS varchar), match_type, match_value, target FROM georules WHERE CAST(zone_id AS varchar) = $1",
+            "SELECT CAST(id AS varchar), match_type, match_value, target, priority, enabled, record_name, record_type FROM georules WHERE CAST(zone_id AS varchar) = $1",
             &[&body.zone_id],
         )
         .await
@@ -1374,6 +1544,10 @@ async fn resolve_by_geo(body: web::Json<GeoResolveRequest>, data: web::Data<Full
             match_type: r.try_get::<_, String>(1).unwrap_or_default(),
             match_value: r.try_get::<_, String>(2).unwrap_or_default(),
             target: r.try_get::<_, String>(3).unwrap_or_default(),
+            priority: r.try_get::<_, i32>(4).unwrap_or(0),
+            enabled: r.try_get::<_, bool>(5).unwrap_or(true),
+            record_name: r.try_get::<_, Option<String>>(6).unwrap_or(None),
+            record_type: r.try_get::<_, Option<String>>(7).unwrap_or(None),
         })
         .collect();
 
@@ -1385,9 +1559,14 @@ async fn resolve_by_geo(body: web::Json<GeoResolveRequest>, data: web::Data<Full
     let mut engine = geodns::GeoRuleEngine::new(db);
     engine.set_rules(rules);
 
-    // Evaluate and return target
-    match engine.evaluate(client_ip) {
-        Some(target) => HttpResponse::Ok().json(serde_json::json!({"target": target})),
+    // Evaluate and return target (pass optional record context)
+    let target = engine.evaluate(
+        client_ip,
+        body.record_name.as_deref(),
+        body.record_type.as_deref(),
+    );
+    match target {
+        Some(t) => HttpResponse::Ok().json(serde_json::json!({"target": t})),
         None => HttpResponse::Ok().json(serde_json::json!({"target": None::<String>, "message": "no matching geo rule"})),
     }
 }
@@ -1864,6 +2043,8 @@ async fn push_config_to_agents(
     struct UpdateZoneReq {
         domain: Option<String>,
         zone_type: Option<String>,
+        #[serde(default)]
+        geodns_enabled: Option<bool>,
     }
 
     async fn update_zone(
@@ -1923,6 +2104,22 @@ async fn push_config_to_agents(
             match (&*data.db).execute(
                 "UPDATE zones SET zone_type = $1, updated_at = now() WHERE CAST(id AS varchar) = $2",
                 &[zone_type, &zone_id]
+            ).await {
+                Ok(count) => {
+                    if count == 0 {
+                        return HttpResponse::NotFound().json(ErrorResponse { error: "zone not found".to_string(), details: None });
+                    }
+                }
+                Err(e) => {
+                    warn!("update_zone error: {}", e);
+                    return HttpResponse::InternalServerError().json(ErrorResponse { error: "failed to update zone".to_string(), details: None });
+                }
+            }
+        }
+        if let Some(enabled) = body.geodns_enabled {
+            match (&*data.db).execute(
+                "UPDATE zones SET geodns_enabled = $1, updated_at = now() WHERE CAST(id AS varchar) = $2",
+                &[&enabled, &zone_id]
             ).await {
                 Ok(count) => {
                     if count == 0 {
@@ -2238,6 +2435,7 @@ async fn main() -> std::io::Result<()> {
             // GeoRules
             .route("/api/v1/georules", web::post().to(create_georule))
             .route("/api/v1/georules", web::get().to(list_georules))
+            .route("/api/v1/georules/{id}", web::put().to(update_georule))
             .route("/api/v1/georules/{id}", web::delete().to(delete_georule))
             .route("/api/v1/georules/resolve", web::post().to(resolve_by_geo))
             // Config Push

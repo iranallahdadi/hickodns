@@ -14,9 +14,11 @@ export default function Zones(){
     { domain: '' },
     (vals) => ({ domain: validators.domain(vals.domain) })
   )
+  const [geodnsEnabled, setGeodnsEnabled] = React.useState(false)
   const [editingZone, setEditingZone] = React.useState(null)
   const [editDomain, setEditDomain] = React.useState('')
   const [editType, setEditType] = React.useState('primary')
+  const [editGeodns, setEditGeodns] = React.useState(false)
 
   // Advanced search with debouncing
   const { searchTerm, filteredItems, handleSearch } = useAdvancedSearch(
@@ -52,8 +54,9 @@ export default function Zones(){
   const create = async () => { 
     if (!validate()) return
     try { 
-      await api.post('/api/v1/zones', { domain: values.domain })
+      await api.post('/api/v1/zones', { domain: values.domain, geodns_enabled: geodnsEnabled })
       reset()
+      setGeodnsEnabled(false)
       load()
       notify?.success(`Zone ${values.domain} created`)
     } catch (e) { 
@@ -65,6 +68,7 @@ export default function Zones(){
     setEditingZone(zone)
     setEditDomain(zone.domain)
     setEditType(zone.zone_type || 'primary')
+    setEditGeodns(zone.geodns_enabled || false)
   }
 
   const cancelEdit = () => {
@@ -79,7 +83,7 @@ export default function Zones(){
       return
     }
     try {
-      await api.put(`/api/v1/zones/${editingZone.id}`, { domain: editDomain, zone_type: editType })
+      await api.put(`/api/v1/zones/${editingZone.id}`, { domain: editDomain, zone_type: editType, geodns_enabled: editGeodns })
       notify?.success('Zone updated')
       cancelEdit()
       load()
@@ -100,6 +104,15 @@ export default function Zones(){
     }
   }
 
+  const toggleZoneGeo = async (zone) => {
+    try {
+      await api.put(`/api/v1/zones/${zone.id}`, { geodns_enabled: !zone.geodns_enabled });
+      load();
+    } catch (e) {
+      notify?.error('Failed to update zone');
+    }
+  }
+
   const onBulkComplete = () => { load(); notify?.success('Zones imported'); }
 
   return (
@@ -110,6 +123,9 @@ export default function Zones(){
           <div className="grid gap-2 mb-4 max-w-md">
             <FormField label="Domain" error={errors.domain}>
               <input className="w-full border dark:border-gray-600 dark:bg-gray-700 dark:text-white rounded px-3 py-2" placeholder="example.com" {...bind('domain')} />
+            </FormField>
+            <FormField label="Enable GeoDNS">
+              <input type="checkbox" checked={geodnsEnabled} onChange={e=>setGeodnsEnabled(e.target.checked)} className="h-5 w-5" />
             </FormField>
             <div className="flex items-center space-x-2">
               <button className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded transition-colors" onClick={create}>Create Zone</button>
@@ -127,6 +143,9 @@ export default function Zones(){
                 <option value="primary">primary</option>
                 <option value="secondary">secondary</option>
               </select>
+            </FormField>
+            <FormField label="Enable GeoDNS">
+              <input type="checkbox" checked={editGeodns} onChange={e=>setEditGeodns(e.target.checked)} className="h-5 w-5" />
             </FormField>
             <div className="flex items-center space-x-2">
               <button className="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded" onClick={saveEdit}>Save</button>
@@ -165,6 +184,7 @@ export default function Zones(){
               />
               <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">Created</th>
               <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">Type</th>
+              <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">GeoDNS</th>
               <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">Actions</th>
             </tr>
           </thead>
@@ -180,6 +200,9 @@ export default function Zones(){
                       {z.created_at ? new Date(z.created_at).toLocaleDateString() : 'N/A'}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">{z.zone_type || 'primary'}</td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <input type="checkbox" checked={z.geodns_enabled} onChange={()=>toggleZoneGeo(z)} className="h-4 w-4" />
+                    </td>
                     <td className="px-6 py-4 whitespace-nowrap space-x-2">
                       <Link to={`/admin/zones/${z.id}/records`} className="text-blue-600 dark:text-blue-400 hover:underline font-medium">
                         Manage Records

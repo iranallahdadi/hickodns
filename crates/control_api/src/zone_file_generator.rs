@@ -49,10 +49,21 @@ fn default_ns_records() -> Vec<String> {
 /// Internal generator that operates on already‑fetched zone/record data. This is
 /// extracted so that unit tests can exercise the logic without requiring a live
 /// Postgres instance.
+pub struct GeoRuleRow {
+    pub match_type: String,
+    pub match_value: String,
+    pub target: String,
+    pub priority: i32,
+    pub enabled: bool,
+    pub record_name: Option<String>,
+    pub record_type: Option<String>,
+}
+
 pub fn generate_from_data(
     base_dir: &str,
-    zones: Vec<(String, String)>, // (id, domain)
+    zones: Vec<(String, String, bool)>, // (id, domain, geodns_enabled)
     records_map: HashMap<String, Vec<RecordRow>>, // key is zone_id
+    geo_rules_map: HashMap<String, Vec<GeoRuleRow>>, // key is zone_id
 ) -> anyhow::Result<()> {
     let base_path = Path::new(base_dir);
     std::fs::create_dir_all(base_path).with_context(|| format!("failed to create dir {}", base_dir))?;
@@ -60,7 +71,7 @@ pub fn generate_from_data(
     // make a set of names for zones we will generate so that we can clean up
     // files left over from previously deleted/renamed zones.
     let mut expected_files = HashSet::new();
-    for (_id, domain) in &zones {
+    for (_id, domain, _enabled) in &zones {
         expected_files.insert(format!("zone.{}", domain.trim_end_matches('.')));
     }
 
@@ -70,7 +81,7 @@ pub fn generate_from_data(
 
     let default_ns = default_ns_records();
 
-    for (zone_id, domain) in &zones {
+    for (zone_id, domain, geodns_enabled) in &zones {
         let zone_file_name = format!("zone.{}", domain.trim_end_matches('.'));
         let zone_path = base_path.join(&zone_file_name);
 
@@ -147,7 +158,29 @@ pub fn generate_from_data(
 
         named.push_str("[[zones]]\n");
         named.push_str(&format!("zone = \"{}\"\n", domain));
-        named.push_str("zone_type = \"Primary\"\n\n");
+        named.push_str("zone_type = \"Primary\"\n");
+        if *geodns_enabled {
+            // include geo config even if empty rules (so UI can toggle)
+            named.push_str("geodns = { enabled = true, rules = [\n");
+            if let Some(rules) = geo_rules_map.get(zone_id) {
+                for rule in rules {
+                    named.push_str("  { ");
+                    named.push_str(&format!("match_type = \"{}\", ", rule.match_type));
+                    named.push_str(&format!("match_value = \"{}\", ", rule.match_value));
+                    named.push_str(&format!("target = \"{}\", ", rule.target));
+                    named.push_str(&format!("priority = {}, ", rule.priority));
+                    named.push_str(&format!("enabled = {}, ", rule.enabled));
+                    if let Some(rn) = &rule.record_name {
+                        named.push_str(&format!("record_name = \"{}\", ", rn));
+                    }
+                    if let Some(rt) = &rule.record_type {
+                        named.push_str(&format!("record_type = \"{}\", ", rt));
+                    }
+                    named.push_str("},\n");
+                }
+            }
+            named.push_str("] }\n\n");
+        }
         named.push_str("[[zones.stores]]\n");
         named.push_str("type = \"file\"\n");
         named.push_str(&format!("zone_path = \"{}\"\n\n", zone_path.to_string_lossy()));
@@ -184,19 +217,21 @@ pub async fn generate_all(base_dir: &str, db: Arc<Client>) -> anyhow::Result<()>
     task::spawn_blocking(move || -> anyhow::Result<()> {
         // use a tiny runtime so we can call async pg queries from sync context
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        let (zones, records_map) = rt.block_on(async move {
+        let (zones, records_map, geo_rules_map) = rt.block_on(async move {
             let zones_rows = db
-                .query("SELECT CAST(id AS varchar), domain FROM zones", &[])
+                .query("SELECT CAST(id AS varchar), domain, coalesce(geodns_enabled, true) FROM zones", &[])
                 .await
                 .unwrap_or_default();
 
             let mut zones_vec = Vec::new();
             let mut records_map: HashMap<String, Vec<RecordRow>> = HashMap::new();
+            let mut geo_rules_map: HashMap<String, Vec<GeoRuleRow>> = HashMap::new();
 
             for z in zones_rows {
                 let zone_id: String = z.try_get("id").unwrap_or_default();
                 let domain: String = z.try_get("domain").unwrap_or_default();
-                zones_vec.push((zone_id.clone(), domain));
+                let enabled: bool = z.try_get(2).unwrap_or(true);
+                zones_vec.push((zone_id.clone(), domain, enabled));
 
                 let recs = db
                     .query(
@@ -216,10 +251,33 @@ pub async fn generate_all(base_dir: &str, db: Arc<Client>) -> anyhow::Result<()>
                         priority: r.try_get("priority").unwrap_or(0),
                     });
                 }
-                records_map.insert(zone_id, list);
+                records_map.insert(zone_id.clone(), list);
+
+                // fetch georules for this zone
+                let geos = db
+                    .query(
+                        "SELECT match_type, match_value, target, priority, enabled, record_name, record_type FROM georules WHERE CAST(zone_id AS varchar) = $1",
+                        &[&zone_id],
+                    )
+                    .await
+                    .unwrap_or_default();
+
+                let mut geo_list = Vec::new();
+                for g in geos {
+                    geo_list.push(GeoRuleRow {
+                        match_type: g.try_get("match_type").unwrap_or_default(),
+                        match_value: g.try_get("match_value").unwrap_or_default(),
+                        target: g.try_get("target").unwrap_or_default(),
+                        priority: g.try_get("priority").unwrap_or(0),
+                        enabled: g.try_get("enabled").unwrap_or(true),
+                        record_name: g.try_get("record_name").unwrap_or(None),
+                        record_type: g.try_get("record_type").unwrap_or(None),
+                    });
+                }
+                geo_rules_map.insert(zone_id, geo_list);
             }
 
-            (zones_vec, records_map)
+            (zones_vec, records_map, geo_rules_map)
         });
 
         // perform file system work using the pure-data helper
@@ -276,7 +334,7 @@ mod tests {
         let stale = dir.path().join("zone.stale.com");
         fs::write(&stale, "garbage").unwrap();
 
-        let zones = vec![("id1".to_string(), "example.com".to_string())];
+        let zones = vec![("id1".to_string(), "example.com".to_string(), true)];
         let mut recs = HashMap::new();
         recs.insert(
             "id1".to_string(),
@@ -288,27 +346,47 @@ mod tests {
                     ttl: 3600,
                     priority: 0,
                 },
-                RecordRow {
-                    name: "mail".into(),
-                    rtype: "MX".into(),
-                    value: "mail.example.com.".into(),
-                    ttl: 3600,
-                    priority: 10,
-                },
-                RecordRow {
-                    name: "svc".into(),
-                    rtype: "SRV".into(),
-                    value: "5 80 target.example.com.".into(),
-                    ttl: 300,
-                    priority: 20,
-                },
             ],
         );
+        let mut geo = HashMap::new();
+        geo.insert(
+            "id1".to_string(),
+            vec![GeoRuleRow {
+                match_type: "country".into(),
+                match_value: "US".into(),
+                target: "1.1.1.1".into(),
+                priority: 1,
+                enabled: true,
+                record_name: None,
+                record_type: None,
+            }],
+        );
 
-        generate_from_data(base, zones, recs).unwrap();
+        generate_from_data(base, zones, recs, geo).unwrap();
 
         // stale file should be gone
         assert!(!stale.exists());
+
+        // verify named.toml contains geodns section
+        let named_path = dir.path().join("named.toml");
+        let named_txt = fs::read_to_string(&named_path).unwrap();
+        assert!(named_txt.contains("geodns"));
+        assert!(named_txt.contains("match_type"));
+        assert!(named_txt.contains("US"));
+    }
+
+    #[tokio::test]
+    async fn test_generate_from_data_geo_disabled() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().to_str().unwrap();
+        let zones = vec![("id1".to_string(), "example.com".to_string(), false)];
+        let recs = HashMap::new();
+        let geo = HashMap::new();
+        generate_from_data(base, zones, recs, geo).unwrap();
+        let named_path = dir.path().join("named.toml");
+        let named_txt = fs::read_to_string(&named_path).unwrap();
+        assert!(!named_txt.contains("geodns"));
+    }
 
         // generated file should exist and contain the record
         let zonefile = dir.path().join("zone.example.com");

@@ -107,6 +107,18 @@ fn test_parse_toml() {
 
     let config = Config::from_toml("directory = \"/dev/null\"").unwrap();
     assert_eq!(config.directory, Path::new("/dev/null"));
+
+    // geodns configuration parsing
+    let config = Config::from_toml(
+        "[[zones]]\nzone = \"example.com\"\nzone_type = \"Primary\"\ngeodns = { enabled = true, rules = [ { match_type=\"country\", match_value=\"US\", target=\"1.1.1.1\", priority=1, enabled=true } ] }\n[zones.stores]\ntype = \"file\"\nzone_path = \"example.com.zone\"\n",
+    )
+    .unwrap();
+    assert!(config.zones[0].geodns.is_some());
+    let geo = config.zones[0].geodns.as_ref().unwrap();
+    assert!(geo.enabled);
+    assert_eq!(geo.rules.len(), 1);
+    assert_eq!(geo.rules[0].match_type, "country");
+    assert_eq!(geo.rules[0].match_value, "US");
 }
 
 #[cfg(feature = "__dnssec")]

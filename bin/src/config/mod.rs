@@ -34,6 +34,11 @@ use serde::{self, Deserialize, Deserializer};
 use thiserror::Error;
 use tracing::{debug, info};
 
+// geodns engine for server-side geo routing
+use geodns;
+// uuid for generating rule ids when loaded from config
+use uuid;
+
 #[cfg(feature = "__dnssec")]
 use crate::dnssec;
 #[cfg(feature = "__https")]
@@ -62,6 +67,33 @@ use hickory_server::{
 
 #[cfg(test)]
 mod tests;
+
+/// GeoDNS per-zone configuration
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GeoRuleConfig {
+    pub match_type: String,
+    pub match_value: String,
+    pub target: String,
+    #[serde(default)]
+    pub priority: i32,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub record_name: Option<String>,
+    #[serde(default)]
+    pub record_type: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+/// GeoDNS configuration block for a zone
+pub(crate) struct GeoConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub rules: Vec<GeoRuleConfig>,
+}
 
 /// Server configuration
 #[derive(Deserialize, Debug)]
@@ -231,6 +263,9 @@ pub(crate) struct ZoneConfig {
     /// type of the zone
     #[serde(flatten)]
     pub zone_type_config: ZoneTypeConfig,
+    /// optional GeoDNS configuration for this zone
+    #[serde(default)]
+    pub geodns: Option<GeoConfig>,
 }
 
 impl ZoneConfig {
@@ -248,6 +283,35 @@ impl ZoneConfig {
         // load the zone and insert any configured zone handlers in the catalog.
 
         let mut handlers: Vec<Arc<dyn ZoneHandler>> = vec![];
+        // if geodns configured, create handler first
+        if let Some(ref geo_cfg) = self.geodns {
+            if geo_cfg.enabled {
+                // build a rule engine from the config
+                let mut rules = Vec::new();
+                for r in &geo_cfg.rules {
+                    rules.push(geodns::GeoRule {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        match_type: r.match_type.clone(),
+                        match_value: r.match_value.clone(),
+                        target: r.target.clone(),
+                        priority: r.priority,
+                        enabled: r.enabled,
+                        record_name: r.record_name.clone(),
+                        record_type: r.record_type.clone(),
+                    });
+                }
+                let db = std::env::var("GEOIP_DB_PATH").ok().and_then(|p| {
+                    std::fs::read(p).ok().and_then(|b| geodns::GeoDB::open_from_bytes(b).ok())
+                });
+                let mut engine = geodns::GeoRuleEngine::new(db);
+                engine.set_rules(rules);
+                let geo_handler = crate::zone_handler::geodns::GeoZoneHandler::new(
+                    zone_name.clone(),
+                    engine,
+                );
+                handlers.push(Arc::new(geo_handler));
+            }
+        }
         match self.zone_type_config {
             ZoneTypeConfig::Primary(server_config) | ZoneTypeConfig::Secondary(server_config) => {
                 debug!(
