@@ -26,7 +26,7 @@ anyhow = "1"
 actix-cors = "0.7"
 
 # OpenAPI / Swagger
-utoipa = "2"
+utoipa = "5"
 utoipa-actix-web = "0.1"
 
 # Rate limiting
